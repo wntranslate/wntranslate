@@ -19,6 +19,30 @@ class Message:
     content: str
 
 
+@dataclass(frozen=True)
+class Usage:
+    """Token usage reported by a provider for one completion.
+
+    Args:
+        input_tokens: Prompt (input) tokens consumed.
+        output_tokens: Generated (output) tokens.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+    def __add__(self, other: Usage) -> Usage:
+        return Usage(self.input_tokens + other.input_tokens, self.output_tokens + other.output_tokens)
+
+    def __bool__(self) -> bool:
+        return bool(self.input_tokens or self.output_tokens)
+
+
+def _int(value: Any) -> int:
+    """Coerce a JSON value to a non-negative token count, treating anything odd as 0."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
 class Provider(ABC):
     """Base class for chat completion providers."""
 

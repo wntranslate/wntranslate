@@ -45,7 +45,7 @@ from .response import (
 from .settings import TranslationSettings
 
 _MAX_REQUEST_ROUNDS = 8
-_MAX_SCHEMA_RETRIES = 3
+_MAX_SCHEMA_RETRIES = 5
 _MAX_CONTINUATION_ROUNDS = 100
 _OVERVIEW_CHAPTERS = 10
 
@@ -88,6 +88,19 @@ def _correction(detail: str) -> str:
         f"Your previous response was rejected: {detail}\n"
         "Fix exactly that and reply again with only a JSON object that matches the schema."
     )
+
+
+def _correction_messages(error: _Retryable, schema: dict[str, Any]) -> list[Message]:
+    """Build the messages to send after a rejected response, re-sending the schema on a schema fail.
+
+    The schema is re-sent first (when the failure was a schema fail) so the correction, which names
+    exactly what to fix, is the final and most salient instruction before the model replies.
+    """
+    messages: list[Message] = []
+    if isinstance(error, _SchemaError):
+        messages.append(_schema_message(schema))
+    messages.append(Message(role="system", content=_correction(error.detail)))
+    return messages
 
 
 class TranslationError(RuntimeError):
@@ -322,7 +335,9 @@ class _BaseWebNovel:
             "original_synopsis": self.original_synopsis,
             "synopsis": self.synopsis,
             "total_chapters": len(self.chapters),
-            "recent_chapters": [{"id": c.id, "title": c.title, "kind": c.kind.value} for c in recent],
+            "recent_chapters": [
+                {"id": c.id, "title": c.title, "original_title": c.original_title, "kind": c.kind.value} for c in recent
+            ],
         }
 
     def _overview_message(self) -> Message:
@@ -695,7 +710,7 @@ class WebNovel(_BaseWebNovel):
                 if schema_retries <= 0:
                     raise TranslationError(error.final) from error
                 schema_retries -= 1
-                conversation.append(Message(role="system", content=_correction(error.detail)))
+                conversation.extend(_correction_messages(error, schema))
                 continue
             if isinstance(result, TranslationRequest):
                 rounds -= 1
@@ -754,6 +769,7 @@ class WebNovel(_BaseWebNovel):
         if self.provider is None:
             raise TranslationError("no provider configured")
         conversation = list(messages)
+        schema = fmt.get("json_schema", {}).get("schema", {})
         retries = _MAX_SCHEMA_RETRIES
         while True:
             raw = self.provider.complete(conversation, response_format=fmt)
@@ -766,7 +782,7 @@ class WebNovel(_BaseWebNovel):
                 conversation = [
                     *conversation,
                     Message(role="assistant", content=raw),
-                    Message(role="system", content=_correction(error.detail)),
+                    *_correction_messages(error, schema),
                 ]
 
 
@@ -889,7 +905,7 @@ class AsyncWebNovel(_BaseWebNovel):
                 if schema_retries <= 0:
                     raise TranslationError(error.final) from error
                 schema_retries -= 1
-                conversation.append(Message(role="system", content=_correction(error.detail)))
+                conversation.extend(_correction_messages(error, schema))
                 continue
             if isinstance(result, TranslationRequest):
                 rounds -= 1
@@ -948,6 +964,7 @@ class AsyncWebNovel(_BaseWebNovel):
         if self.provider is None:
             raise TranslationError("no provider configured")
         conversation = list(messages)
+        schema = fmt.get("json_schema", {}).get("schema", {})
         retries = _MAX_SCHEMA_RETRIES
         while True:
             raw = await self.provider.complete(conversation, response_format=fmt)
@@ -960,5 +977,5 @@ class AsyncWebNovel(_BaseWebNovel):
                 conversation = [
                     *conversation,
                     Message(role="assistant", content=raw),
-                    Message(role="system", content=_correction(error.detail)),
+                    *_correction_messages(error, schema),
                 ]

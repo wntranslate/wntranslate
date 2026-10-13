@@ -1,4 +1,5 @@
-from .base import AsyncProvider, Message, Provider
+from .anthropic import AnthropicProvider
+from .base import AsyncProvider, Message, Provider, Usage
 from .openai import (
     DeepSeekProvider,
     OpenAIProvider,
@@ -8,6 +9,7 @@ from .openai import (
 )
 
 __all__ = [
+    "AnthropicProvider",
     "AsyncProvider",
     "DeepSeekProvider",
     "Message",
@@ -15,5 +17,6 @@ __all__ = [
     "Provider",
     "ProviderError",
     "ReasoningEffort",
+    "Usage",
     "json_schema_format",
 ]

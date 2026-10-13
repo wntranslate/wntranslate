@@ -46,8 +46,9 @@ _ONOMATOPOEIA = (
 
 _DATA_REQUEST = (
     "You are given the glossary, notes, running summary, the work's title and synopsis, and a list of the most recent "
-    "chapters (each one's id, title, and kind). For anything else — an older chapter's entry or the full chapter "
-    "list, a chapter's translated text, its summary, or its original title or content — return a data request "
+    "chapters (each one's id, title, original title, and kind). For anything else — an older chapter's entry or the "
+    "full chapter list, a chapter's translated text, its summary, or its original title or content — return a data "
+    "request "
     "(response_type 'request') listing every item; the data, or a note that it does not exist, comes back and you "
     "continue. Do not request the glossary, notes, title, or synopsis — they are always provided."
 )
@@ -128,7 +129,12 @@ def _glossary_rules(settings: TranslationSettings) -> str:
 
 def _summary_rule(settings: TranslationSettings) -> str | None:
     if settings.context_type is ContextType.ROLLING_SUMMARY:
-        return "A running story summary is provided and may omit details; keep continuity from it and return an updated summary."
+        return (
+            "A running story summary is provided and may omit details. Keep continuity from it and return an updated "
+            "summary, but keep it COMPRESSED: rewrite and condense rather than appending — merge and generalize older "
+            "events, and drop stale, resolved, or fine-grained details no longer needed to translate later chapters. "
+            "It may grow as the story does, but prune so it stays a concise digest, never an ever-growing log."
+        )
     if settings.context_type is ContextType.NONE:
         return "Do not maintain a running story summary."
     return None

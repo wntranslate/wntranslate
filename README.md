@@ -1,11 +1,18 @@
 # WNTranslate
 Simple yet comprehensive AI-assisted webnovel translation tool. Keeps track of the plot properly to ensure smooth translation.
 
-Tested with local llama.cpp self-hosted Qwen3.6 35B A3B model, and Deepseek V4.1 Flash. I recommend using this library with a provider that supports `json_schema` (which Deepseek does not support) although Deepseek worked decently well.
+**Models and testing**
+Tested with local llama.cpp self-hosted Qwen3.6 35B A3B model, Deepseek V4.1 Flash, and Claude Haiku 5.5. I recommend using this library with a provider that supports `json_schema` (which Deepseek does not support) although Deepseek worked decently well with our no json schema mode.
 
 A high parameter model is recommended to understand the prompt and properly apply translations. This library uses a four-pass system (analyze, translate, review, apply glossary) every single translation, and thinking mode is recommended to be OFF (`ReasoningEffort.NONE`) or LOW (`ReasoningEffort.LOW`), otherwise each chapter will take a lot of time.
 
-It takes under 60s to translate a single chapter (standard length) using Deepseek V4.1 Flash with no reasoning, costing under $0.02 per chapter.
+Testing chapter length averages ~2000 Japanese characters, on official APIs.
+- Deepseek V4.1 Flash: Under 60s on average per chapter, costing under $0.03 per chapter.
+- Claude Haiku 5.5: Under Ns on average per chapter, costing under $0.075 per chapter
+
+For cheaper translations, Deepseek V4.1 Flash (`deepseek-flash`) is recommended, however if you're willing to spend a bit more (1.85-3.7x more expensive), Claude Haiku 5.5 (`claude-haiku-5-5`) is better for quality and speed.
+
+With reasoning, it can take 5 minutes or more, and is not recommended. Local or open weight models without an official API will not be listed here as the speed will differ based on device and/or provider.
 
 ### Features
 - **Glossary** for consistent naming across chapters:

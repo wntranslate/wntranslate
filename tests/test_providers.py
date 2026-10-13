@@ -2,6 +2,7 @@ import io
 import json
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
 from typing import Any, Self
 
 import pytest
@@ -12,6 +13,7 @@ from wntranslate import (
     OpenAIProvider,
     ProviderError,
     ReasoningEffort,
+    Usage,
     json_schema_format,
 )
 
@@ -28,6 +30,20 @@ class _FakeResponse:
 
     def __exit__(self, *args: object) -> bool:
         return False
+
+
+class _FakeStream:
+    def __init__(self, lines: list[str]) -> None:
+        self._lines = lines
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return False
+
+    def __iter__(self) -> Iterator[bytes]:
+        return iter(f"{line}\n".encode() for line in self._lines)
 
 
 def test_builds_request(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -171,3 +187,53 @@ def test_unexpected_payload_raises(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_json_schema_format() -> None:
     fmt = json_schema_format("out", {"type": "object"}, strict=True)
     assert fmt == {"type": "json_schema", "json_schema": {"name": "out", "schema": {"type": "object"}, "strict": True}}
+
+
+def test_usage_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_urlopen(request: urllib.request.Request, timeout: float | None = None) -> _FakeResponse:
+        payload = {"choices": [{"message": {"content": "ok"}}], "usage": {"prompt_tokens": 120, "completion_tokens": 34}}
+        return _FakeResponse(json.dumps(payload).encode("utf-8"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    seen: list[Usage] = []
+    OpenAIProvider(model="m", on_usage=seen.append).complete([Message(role="user", content="hi")])
+    assert seen == [Usage(120, 34)]
+
+
+def test_usage_absent_no_callback(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_urlopen(request: urllib.request.Request, timeout: float | None = None) -> _FakeResponse:
+        return _FakeResponse(json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    seen: list[Usage] = []
+    OpenAIProvider(model="m", on_usage=seen.append).complete([Message(role="user", content="hi")])
+    assert seen == []
+
+
+def test_stream_reports_usage_and_requests_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(request: urllib.request.Request, timeout: float | None = None) -> _FakeStream:
+        captured["body"] = json.loads(request.data.decode("utf-8")) if request.data else None
+        return _FakeStream(
+            [
+                'data: {"choices": [{"delta": {"content": "hel"}}]}',
+                'data: {"choices": [{"delta": {"content": "lo"}}]}',
+                'data: {"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 2}}',
+                "data: [DONE]",
+            ]
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    seen: list[Usage] = []
+    out = OpenAIProvider(model="m", stream=True, on_usage=seen.append).complete([Message(role="user", content="hi")])
+    assert out == "hello"
+    assert seen == [Usage(7, 2)]
+    assert captured["body"]["stream_options"] == {"include_usage": True}
+
+
+def test_usage_arithmetic() -> None:
+    total = Usage(10, 3) + Usage(5, 20)
+    assert total == Usage(15, 23)
+    assert bool(Usage(0, 0)) is False
+    assert bool(Usage(1, 0)) is True

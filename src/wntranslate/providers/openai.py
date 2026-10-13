@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from .base import Message, Provider
+from .base import Message, Provider, Usage, _int
 
 
 class ProviderError(RuntimeError):
@@ -51,18 +51,20 @@ class OpenAIProvider(Provider):
         headers: Extra headers to send.
         stream: Whether to stream the response (and call on_token per piece).
         on_token: Callback invoked with each streamed text piece.
+        on_usage: Callback invoked once per completion with its token Usage.
     """
 
     model: str
     api_key: str | None = None
     base_url: str = "https://api.openai.com/v1"
-    timeout: float | None = 600.0
+    timeout: float | None = 1200.0
     temperature: float | None = 0.3
     supports_schema: bool = True
     reasoning_effort: ReasoningEffort | None = ReasoningEffort.NONE
     headers: dict[str, str] = field(default_factory=dict)
     stream: bool = False
     on_token: Callable[[str], None] | None = None
+    on_usage: Callable[[Usage], None] | None = None
 
     def complete(
         self,
@@ -93,7 +95,12 @@ class OpenAIProvider(Provider):
             raise ProviderError(f"unexpected response: {payload!r}") from error
         if not isinstance(content, str):
             raise ProviderError(f"non-text content: {content!r}")
+        self._emit(_usage(payload))
         return content
+
+    def _emit(self, usage: Usage) -> None:
+        if self.on_usage is not None and usage:
+            self.on_usage(usage)
 
     def _request(self, body: dict[str, Any]) -> urllib.request.Request:
         headers = {"Content-Type": "application/json", **self.headers}
@@ -116,8 +123,9 @@ class OpenAIProvider(Provider):
         return decoded
 
     def _stream(self, body: dict[str, Any]) -> str:
-        request = self._request({**body, "stream": True})
+        request = self._request({**body, "stream": True, "stream_options": {"include_usage": True}})
         pieces: list[str] = []
+        usage = Usage()
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 for raw_line in response:
@@ -127,15 +135,16 @@ class OpenAIProvider(Provider):
                     data = line[len("data:") :].strip()
                     if data == "[DONE]":
                         break
-                    self._consume(data, pieces)
+                    usage = self._consume(data, pieces) or usage
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", "replace")
             raise ProviderError(f"{error.code} {error.reason}: {detail}") from error
         except urllib.error.URLError as error:
             raise ProviderError(str(error.reason)) from error
+        self._emit(usage)
         return "".join(pieces)
 
-    def _consume(self, data: str, pieces: list[str]) -> None:
+    def _consume(self, data: str, pieces: list[str]) -> Usage | None:
         content, reasoning = _delta(data)
         if reasoning and self.on_token is not None:
             self.on_token(reasoning)
@@ -143,6 +152,7 @@ class OpenAIProvider(Provider):
             pieces.append(content)
             if self.on_token is not None:
                 self.on_token(content)
+        return _stream_usage(data)
 
 
 @dataclass
@@ -210,6 +220,30 @@ def _delta(data: str) -> tuple[str, str]:
     content = delta.get("content")
     reasoning = delta.get("reasoning_content")
     return (content if isinstance(content, str) else ""), (reasoning if isinstance(reasoning, str) else "")
+
+
+def _usage(payload: dict[str, Any]) -> Usage:
+    """Read token usage from a chat completions response (or streamed chunk)."""
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return Usage()
+    return Usage(_int(usage.get("prompt_tokens")), _int(usage.get("completion_tokens")))
+
+
+def _stream_usage(data: str) -> Usage | None:
+    """Read token usage from one SSE data payload, or None when it carries none.
+
+    OpenAI-compatible endpoints send usage in a final chunk (with include_usage) whose
+    choices list is empty; non-usage chunks yield None so the caller keeps the last total.
+    """
+    try:
+        event = json.loads(data)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(event, dict):
+        return None
+    usage = _usage(event)
+    return usage or None
 
 
 def json_schema_format(name: str, schema: dict[str, Any], *, strict: bool = False) -> dict[str, Any]:

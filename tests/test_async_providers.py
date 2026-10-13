@@ -5,7 +5,7 @@ from typing import Any, Self
 import aiohttp
 import pytest
 
-from wntranslate import Message, ProviderError
+from wntranslate import Message, ProviderError, Usage
 from wntranslate.providers.async_openai import AsyncOpenAIProvider
 
 
@@ -80,3 +80,13 @@ def test_async_payload_and_headers() -> None:
     assert payload["temperature"] == 0.5
     assert provider._headers()["Authorization"] == "Bearer k"
     assert "Authorization" not in AsyncOpenAIProvider(model="m")._headers()
+
+
+def test_async_usage_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {"choices": [{"message": {"content": "hello"}}], "usage": {"prompt_tokens": 90, "completion_tokens": 12}}
+    resp = _FakeResp(200, json.dumps(payload).encode("utf-8"))
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: _FakeSession(resp, {}))
+    seen: list[Usage] = []
+    provider = AsyncOpenAIProvider(model="gpt-x", on_usage=seen.append)
+    asyncio.run(provider.complete([Message(role="user", content="hi")]))
+    assert seen == [Usage(90, 12)]

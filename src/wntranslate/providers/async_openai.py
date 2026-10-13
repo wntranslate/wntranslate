@@ -7,8 +7,15 @@ from typing import Any
 
 import aiohttp
 
-from .base import AsyncProvider, Message
-from .openai import ProviderError, ReasoningEffort, _build_body, _delta
+from .base import AsyncProvider, Message, Usage
+from .openai import (
+    ProviderError,
+    ReasoningEffort,
+    _build_body,
+    _delta,
+    _stream_usage,
+    _usage,
+)
 
 
 @dataclass
@@ -27,18 +34,20 @@ class AsyncOpenAIProvider(AsyncProvider):
         headers: Extra headers to send.
         stream: Whether to stream the response (and call on_token per piece).
         on_token: Callback invoked with each streamed text piece.
+        on_usage: Callback invoked once per completion with its token Usage.
     """
 
     model: str
     api_key: str | None = None
     base_url: str = "https://api.openai.com/v1"
-    timeout: float | None = 600.0
+    timeout: float | None = 1200.0
     temperature: float | None = 0.3
     supports_schema: bool = True
     reasoning_effort: ReasoningEffort | None = ReasoningEffort.NONE
     headers: dict[str, str] = field(default_factory=dict)
     stream: bool = False
     on_token: Callable[[str], None] | None = None
+    on_usage: Callable[[Usage], None] | None = None
 
     async def complete(
         self,
@@ -81,11 +90,17 @@ class AsyncOpenAIProvider(AsyncProvider):
             raise ProviderError(f"unexpected response: {decoded!r}") from error
         if not isinstance(content, str):
             raise ProviderError(f"non-text content: {content!r}")
+        self._emit(_usage(decoded))
         return content
 
+    def _emit(self, usage: Usage) -> None:
+        if self.on_usage is not None and usage:
+            self.on_usage(usage)
+
     async def _stream(self, url: str, payload: dict[str, Any], timeout: aiohttp.ClientTimeout) -> str:
-        payload = {**payload, "stream": True}
+        payload = {**payload, "stream": True, "stream_options": {"include_usage": True}}
         pieces: list[str] = []
+        usage = Usage()
         try:
             async with (
                 aiohttp.ClientSession(timeout=timeout) as session,
@@ -108,8 +123,10 @@ class AsyncOpenAIProvider(AsyncProvider):
                         pieces.append(content)
                         if self.on_token is not None:
                             self.on_token(content)
+                    usage = _stream_usage(data) or usage
         except aiohttp.ClientError as error:
             raise ProviderError(str(error)) from error
+        self._emit(usage)
         return "".join(pieces)
 
     def _payload(

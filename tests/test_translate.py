@@ -340,7 +340,29 @@ def test_schema_retry_gives_up_after_limit() -> None:
     wn = WebNovel("src", "", provider=provider)
     with pytest.raises(TranslationError, match="response schema invalid"):
         wn.request_change("x")
-    assert provider.calls == 4
+    assert provider.calls == 6
+
+
+def test_schema_fail_resends_full_schema() -> None:
+    ok = TranslationResponse(
+        glossary_updates=[GlossaryUpdate(op=GlossaryOp.NEW, name="A", original_name="あ", type=NameType.PERSON)]
+    )
+    provider = FakeProvider(["not json", _dump(ok)])
+    wn = WebNovel("src", "", provider=provider)
+    wn.request_change("x")
+    assert provider.calls == 2
+    assert sum("JSON Schema" in m.content for m in provider.last_messages) >= 2
+    assert any("was rejected" in m.content for m in provider.last_messages)
+
+
+def test_overview_recent_chapters_include_original_title() -> None:
+    wn = WebNovel("src", "")
+    wn.chapters.append(
+        Chapter(original_title="元タイトル", original_content="c", title="The Title", content=Content(nodes=[TextNode(text="hi")]))
+    )
+    recent = wn._overview()["recent_chapters"]
+    assert recent[0]["title"] == "The Title"
+    assert recent[0]["original_title"] == "元タイトル"
 
 
 def test_full_schema_is_sent_to_the_model() -> None:

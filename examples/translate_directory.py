@@ -38,14 +38,20 @@ from wntranslate import (
     ReasoningEffort,
     TranslationResponse,
     TranslationSettings,
+    Usage,
 )
+from wntranslate.providers.async_anthropic import AsyncAnthropicProvider
 from wntranslate.providers.async_openai import (
     AsyncDeepSeekProvider,
     AsyncOpenAIProvider,
 )
 from wntranslate.render import render_content_html
 
-_PROVIDERS = {"openai": AsyncOpenAIProvider, "deepseek": AsyncDeepSeekProvider}
+_PROVIDERS: dict[str, type[AsyncOpenAIProvider | AsyncAnthropicProvider]] = {
+    "openai": AsyncOpenAIProvider,
+    "deepseek": AsyncDeepSeekProvider,
+    "anthropic": AsyncAnthropicProvider,
+}
 
 _CSS = """
 body { margin: 0; background: #fdfdfc; color: #1a1a1a; font-family: Georgia, serif; line-height: 1.7; }
@@ -147,6 +153,13 @@ def _page(title: str, body: str, *, script: str = "") -> bytes:
     return document.encode("utf-8")
 
 
+def _usage_suffix(usage: Usage) -> str:
+    """Render a token-usage tag (input and output, summed over every pass), or '' when none."""
+    if not usage:
+        return ""
+    return f" ({usage.input_tokens:,} in / {usage.output_tokens:,} out tokens)"
+
+
 def _summarize_response(response: TranslationResponse) -> str:
     parts = []
     if response.glossary_updates:
@@ -193,8 +206,10 @@ class Translator:
         self.requested: int | None = None
         self.metadata_state = "done" if project.title is not None else "pending"
         self.stream_text: dict[int, str] = {}
-        self.token_counts: dict[int, int] = {}
+        self.usage: dict[int, Usage] = {}
         self._streaming: int | None = None
+        self._request_usage = Usage()
+        self._tracking_request = False
         self.requests: list[str] = []
         self.request_status: str | None = None
         self.request_error: str | None = None
@@ -212,8 +227,18 @@ class Translator:
         """Append a streamed token to the chapter currently being translated."""
         if self._streaming is not None:
             self.stream_text[self._streaming] = self.stream_text.get(self._streaming, "") + piece
-            self.token_counts[self._streaming] = self.token_counts.get(self._streaming, 0) + 1
             self._notify()
+
+    def feed_usage(self, usage: Usage) -> None:
+        """Add one completion's token usage to the chapter or request in progress.
+
+        The worker runs one unit at a time, so usage from every pass of the current
+        chapter (or request) accumulates here across all its chat completions.
+        """
+        if self._tracking_request:
+            self._request_usage += usage
+        elif self._streaming is not None:
+            self.usage[self._streaming] = self.usage.get(self._streaming, Usage()) + usage
 
     def _request_status_text(self) -> str:
         return {
@@ -335,12 +360,17 @@ class Translator:
         started = time.monotonic()
         error: str | None = None
         result: str | None = None
+        self._request_usage = Usage()
+        self._tracking_request = True
         try:
             result = _summarize_response(await self.project.request_change(text))
             self._save()
         except Exception as exc:  # noqa: BLE001 - surface any failure and keep serving
             error = str(exc)
+        finally:
+            self._tracking_request = False
         elapsed = time.monotonic() - started
+        usage = self._request_usage
         async with self.cond:
             if error is not None:
                 self.request_status = "error"
@@ -349,7 +379,7 @@ class Translator:
             else:
                 self.request_status = "done"
                 self.request_result = result
-                print(f"Applied request in {elapsed:.1f}s ({result})", file=sys.stderr)
+                print(f"Applied request in {elapsed:.1f}s ({result}){_usage_suffix(usage)}", file=sys.stderr)
             self.cond.notify_all()
             self._notify()
 
@@ -359,7 +389,7 @@ class Translator:
         error: str | None = None
         chapter: Chapter | None = None
         self.stream_text[index] = ""
-        self.token_counts[index] = 0
+        self.usage[index] = Usage()
         self._streaming = index
         try:
             chapter = await self.project.translate_new_chapter(title, content)
@@ -369,19 +399,21 @@ class Translator:
         finally:
             self._streaming = None
         elapsed = time.monotonic() - started
+        usage = self.usage.pop(index, Usage())
         async with self.cond:
             if error is not None:
                 self.status[index] = "error"
                 self.errors[index] = error
-                print(f"Failed chapter {index + 1} ({title}) after {elapsed:.1f}s: {error}", file=sys.stderr)
+                print(f"Failed chapter {index + 1} ({title}) after {elapsed:.1f}s{_usage_suffix(usage)}: {error}", file=sys.stderr)
             else:
                 assert chapter is not None
                 self.translated[index] = chapter
                 self.status[index] = "done"
                 self.stream_text.pop(index, None)
-                tokens = self.token_counts.pop(index, 0)
-                suffix = f" and {tokens} tokens" if tokens else ""
-                print(f"Translated chapter {index + 1} ({chapter.title or title}) in {elapsed:.1f}s{suffix}", file=sys.stderr)
+                print(
+                    f"Translated chapter {index + 1} ({chapter.title or title}) in {elapsed:.1f}s{_usage_suffix(usage)}",
+                    file=sys.stderr,
+                )
             self.cond.notify_all()
             self._notify()
 
@@ -519,7 +551,13 @@ def main() -> int:
         "--reasoning-effort",
         choices=["off", *(effort.value for effort in ReasoningEffort)],
         default=ReasoningEffort.NONE.value,
-        help="Reasoning effort to request; 'off' omits the field for endpoints that reject it",
+        help="Reasoning effort to request (ignored for anthropic); 'off' omits the field for endpoints that reject it",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=8192,
+        help="Max output tokens per response (anthropic only; raise for long chapters)",
     )
     parser.add_argument("--source-language", default="Japanese")
     parser.add_argument("--target-language", default="English")
@@ -540,10 +578,13 @@ def main() -> int:
         "api_key": args.api_key,
         "timeout": args.timeout if args.timeout > 0 else None,
         "stream": args.stream,
-        "reasoning_effort": None if args.reasoning_effort == "off" else ReasoningEffort(args.reasoning_effort),
     }
     if args.base_url is not None:
         provider_kwargs["base_url"] = args.base_url
+    if args.provider == "anthropic":
+        provider_kwargs["max_tokens"] = args.max_tokens
+    else:
+        provider_kwargs["reasoning_effort"] = None if args.reasoning_effort == "off" else ReasoningEffort(args.reasoning_effort)
     base_provider = _PROVIDERS[args.provider](**provider_kwargs)
     provider: AsyncProvider = LoggingProvider(base_provider) if args.show_logs else base_provider
 
@@ -566,6 +607,7 @@ def main() -> int:
         )
 
     translator = Translator(project, [load_chapter(path) for path in files], max(args.pretranslate, 0), save_path)
+    base_provider.on_usage = translator.feed_usage
 
     if args.stream:
         echo_to_console = args.show_logs

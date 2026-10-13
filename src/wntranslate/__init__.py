@@ -32,6 +32,7 @@ from .prompts import (
     generate_translation_prompt,
 )
 from .providers import (
+    AnthropicProvider,
     AsyncProvider,
     DeepSeekProvider,
     Message,
@@ -39,6 +40,7 @@ from .providers import (
     Provider,
     ProviderError,
     ReasoningEffort,
+    Usage,
     json_schema_format,
 )
 from .request import DataRequest, DataResult, TranslationRequest, request_schema
@@ -66,6 +68,7 @@ from .webnovel import AsyncWebNovel, TranslationError, WebNovel
 __all__ = [
     "Alias",
     "AliasSuggestion",
+    "AnthropicProvider",
     "AsyncProvider",
     "AsyncWebNovel",
     "Chapter",
@@ -109,6 +112,7 @@ __all__ = [
     "TranslationRequest",
     "TranslationResponse",
     "TranslationSettings",
+    "Usage",
     "WebNovel",
     "__version__",
     "analysis_schema",
