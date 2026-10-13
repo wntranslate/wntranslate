@@ -8,7 +8,7 @@ A high parameter model is recommended to understand the prompt and properly appl
 
 Testing chapter length averages ~2000 Japanese characters, on official APIs.
 - Deepseek V4.1 Flash: Under 60s on average per chapter, costing under $0.03 per chapter.
-- Claude Haiku 5.5: Under Ns on average per chapter, costing under $0.075 per chapter
+- Claude Haiku 5.5: Under 60s on average per chapter, costing under $0.075 per chapter
 
 For cheaper translations, Deepseek V4.1 Flash (`deepseek-flash`) is recommended, however if you're willing to spend a bit more (1.85-3.7x more expensive), Claude Haiku 5.5 (`claude-haiku-5-5`) is better for quality and speed.
 
