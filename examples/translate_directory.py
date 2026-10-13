@@ -33,6 +33,7 @@ from wntranslate import (
     Chapter,
     Creativity,
     Message,
+    TranslationResponse,
     TranslationSettings,
 )
 from wntranslate.providers.async_openai import (
@@ -59,6 +60,12 @@ body { margin: 0; background: #fdfdfc; color: #1a1a1a; font-family: Georgia, ser
 .status { text-align: center; margin-top: 4rem; font-family: system-ui, sans-serif; color: #666; }
 .stream { white-space: pre-wrap; word-break: break-word; font-size: 0.8rem; color: #888; background: #8881; padding: 12px; border-radius: 6px; }
 .error { color: #c92a2a; white-space: pre-wrap; }
+.request { margin-top: 2.5rem; border-top: 1px solid #8884; padding-top: 1.5rem; display: flex; flex-direction: column;
+           gap: 8px; font-family: system-ui, sans-serif; }
+.request label { font-size: 0.9rem; color: #666; }
+.request textarea { width: 100%; box-sizing: border-box; font: inherit; padding: 8px; resize: vertical; }
+.request button { align-self: flex-start; font: inherit; padding: 6px 14px; }
+.request-status { font-size: 0.9rem; color: #666; margin: 4px 0 0; }
 .footnotes { margin-top: 2.5rem; border-top: 1px solid #8884; padding-top: 1rem; font-size: 0.9rem; }
 .footnotes a.footnote-back { color: inherit; text-decoration: none; }
 """
@@ -99,6 +106,17 @@ def _page(title: str, body: str, *, refresh: int | None = None) -> bytes:
     return document.encode("utf-8")
 
 
+def _summarize_response(response: TranslationResponse) -> str:
+    parts = []
+    if response.glossary_updates:
+        parts.append(f"{len(response.glossary_updates)} glossary change(s)")
+    if response.chapters:
+        parts.append(f"{len(response.chapters)} chapter change(s)")
+    if response.context is not None:
+        parts.append("context updated")
+    return ", ".join(parts) or "no changes"
+
+
 class LoggingProvider(AsyncProvider):
     """Wraps an async provider and prints each request's messages and response."""
 
@@ -136,6 +154,10 @@ class Translator:
         self.stream_text: dict[int, str] = {}
         self.token_counts: dict[int, int] = {}
         self._streaming: int | None = None
+        self.requests: list[str] = []
+        self.request_status: str | None = None
+        self.request_error: str | None = None
+        self.request_result: str | None = None
         self.cond = asyncio.Condition()
         self._seed_from_project()
 
@@ -188,22 +210,67 @@ class Translator:
                     self.pending.add(candidate)
             self.cond.notify_all()
 
-    def _next(self) -> int | None:
+    def _next_chapter(self) -> int | None:
         if not self.pending:
             return None
         index = self.requested if self.requested in self.pending else min(self.pending)
         self.pending.discard(index)
         return index
 
+    async def submit_request(self, text: str) -> None:
+        """Queue a free-form change request; it runs after the current translation, before the next.
+
+        Args:
+            text: The written request to apply via request_change.
+        """
+        async with self.cond:
+            self.requests.append(text)
+            if self.request_status != "running":
+                self.request_status = "queued"
+            self.cond.notify_all()
+
     async def _run(self) -> None:
         while True:
+            text: str | None = None
+            index: int | None = None
             async with self.cond:
-                index = self._next()
-                while index is None:
+                while not self.requests and not self.pending:
                     await self.cond.wait()
-                    index = self._next()
-                self.status[index] = "translating"
-            await self._translate(index)
+                if self.requests:
+                    text = self.requests.pop(0)
+                    self.request_status = "running"
+                    self.request_error = None
+                    self.request_result = None
+                    self.cond.notify_all()
+                else:
+                    index = self._next_chapter()
+                    assert index is not None
+                    self.status[index] = "translating"
+            if text is not None:
+                await self._run_request(text)
+            elif index is not None:
+                await self._translate(index)
+
+    async def _run_request(self, text: str) -> None:
+        started = time.monotonic()
+        error: str | None = None
+        result: str | None = None
+        try:
+            result = _summarize_response(await self.project.request_change(text))
+            self._save()
+        except Exception as exc:  # noqa: BLE001 - surface any failure and keep serving
+            error = str(exc)
+        elapsed = time.monotonic() - started
+        async with self.cond:
+            if error is not None:
+                self.request_status = "error"
+                self.request_error = error
+                print(f"Request failed after {elapsed:.1f}s: {error}", file=sys.stderr)
+            else:
+                self.request_status = "done"
+                self.request_result = result
+                print(f"Applied request in {elapsed:.1f}s ({result})", file=sys.stderr)
+            self.cond.notify_all()
 
     async def _translate(self, index: int) -> None:
         title, content = self.sources[index]
@@ -257,7 +324,7 @@ class Translator:
 
     def render_toc(self) -> bytes:
         total = len(self.sources)
-        busy = bool(self.pending) or self.metadata_state == "translating"
+        busy = bool(self.pending) or self.metadata_state == "translating" or self.request_status in ("queued", "running")
         items = []
         for index in range(total):
             state = self.status.get(index, "pending")
@@ -274,8 +341,28 @@ class Translator:
         if synopsis:
             paragraphs = "".join(f"<p>{escape(part)}</p>" for part in synopsis.split("\n\n") if part.strip())
             description = f'<div class="synopsis">{paragraphs}</div>'
-        body = f'<main class="wrap"><h1>{heading}</h1>{description}<ol class="toc-list">{"".join(items)}</ol></main>'
+        body = (
+            f'<main class="wrap"><h1>{heading}</h1>{description}'
+            f'<ol class="toc-list">{"".join(items)}</ol>{self._render_request_box()}</main>'
+        )
         return _page("Contents", body, refresh=3 if busy else None)
+
+    def _render_request_box(self) -> str:
+        notices = {
+            "queued": '<p class="request-status">Request queued…</p>',
+            "running": '<p class="request-status">Applying request…</p>',
+            "done": f'<p class="request-status">Applied: {escape(self.request_result or "no changes")}</p>',
+            "error": f'<p class="request-status error">Request failed: {escape(self.request_error or "error")}</p>',
+        }
+        status = notices.get(self.request_status or "", "")
+        return (
+            '<form method="post" action="/request" class="request">'
+            '<label for="request">Request a change (glossary edit, retitle, add a note, reorder, …)</label>'
+            '<textarea id="request" name="request" rows="3" '
+            'placeholder="e.g. Rename the protagonist to Iroha everywhere and note that the tone is comedic."></textarea>'
+            "<button>Submit request</button>"
+            f"{status}</form>"
+        )
 
     async def render_chapter(self, index: int) -> bytes:
         await self._request(index)
@@ -304,6 +391,15 @@ class Translator:
 async def _toc(request: web.Request) -> web.Response:
     translator: Translator = request.app["translator"]
     return web.Response(body=translator.render_toc(), content_type="text/html", charset="utf-8")
+
+
+async def _submit_request(request: web.Request) -> web.Response:
+    translator: Translator = request.app["translator"]
+    data = await request.post()
+    text = str(data.get("request", "")).strip()
+    if text:
+        await translator.submit_request(text)
+    raise web.HTTPFound("/")
 
 
 async def _chapter(request: web.Request) -> web.Response:
@@ -380,11 +476,13 @@ def main() -> int:
     translator = Translator(project, [load_chapter(path) for path in files], max(args.pretranslate, 0), save_path)
 
     if args.stream:
+        echo_to_console = args.show_logs
 
         def on_token(piece: str) -> None:
             translator.feed_token(piece)
-            sys.stderr.buffer.write(piece.encode("utf-8", "replace"))
-            sys.stderr.buffer.flush()
+            if echo_to_console:
+                sys.stderr.buffer.write(piece.encode("utf-8", "replace"))
+                sys.stderr.buffer.flush()
 
         base_provider.on_token = on_token
 
@@ -393,6 +491,7 @@ def main() -> int:
     app.add_routes(
         [
             web.get("/", _toc),
+            web.post("/request", _submit_request),
             web.get("/chapter/{index}", _chapter),
             web.post("/chapter/{index}/retranslate", _retranslate),
         ]
