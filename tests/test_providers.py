@@ -11,6 +11,7 @@ from wntranslate import (
     Message,
     OpenAIProvider,
     ProviderError,
+    ReasoningEffort,
     json_schema_format,
 )
 
@@ -62,6 +63,36 @@ def test_deepseek_preset() -> None:
     provider = DeepSeekProvider(model="deepseek-chat")
     assert provider.supports_schema is False
     assert provider.base_url == "https://api.deepseek.com/v1"
+    assert provider.reasoning_effort is ReasoningEffort.LOW
+
+
+def _capture_body(monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]) -> None:
+    def fake_urlopen(request: urllib.request.Request, timeout: float | None = None) -> _FakeResponse:
+        captured["body"] = json.loads(request.data.decode("utf-8")) if request.data else None
+        return _FakeResponse(json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+
+def test_reasoning_effort_defaults_to_low(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+    _capture_body(monkeypatch, captured)
+    OpenAIProvider(model="m").complete([Message(role="user", content="hi")])
+    assert captured["body"]["reasoning_effort"] == "low"
+
+
+def test_reasoning_effort_custom_level(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+    _capture_body(monkeypatch, captured)
+    OpenAIProvider(model="m", reasoning_effort=ReasoningEffort.NONE).complete([Message(role="user", content="hi")])
+    assert captured["body"]["reasoning_effort"] == "none"
+
+
+def test_reasoning_effort_omitted_when_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+    _capture_body(monkeypatch, captured)
+    OpenAIProvider(model="m", reasoning_effort=None).complete([Message(role="user", content="hi")])
+    assert "reasoning_effort" not in captured["body"]
 
 
 def test_schema_passed_through_when_supported(monkeypatch: pytest.MonkeyPatch) -> None:

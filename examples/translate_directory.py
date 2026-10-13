@@ -3,9 +3,10 @@
 Files are numbered (e.g. 0001.txt, 2.txt, 000003.txt) and sorted by that number.
 Each file has its title on the first line and its content on the rest. Chapters are
 translated on demand by an async worker: visiting one starts translating it (and up to
---pretranslate chapters ahead) and the page auto-reloads when ready; already-translated
-chapters stay servable while another chapter is translating. The project is saved after
-each chapter finishes.
+--pretranslate chapters ahead). Pages update live over a WebSocket — badges, streamed
+tokens, and request status change in place without reloading; already-translated chapters
+stay servable while another chapter is translating. The project is saved after each
+chapter finishes.
 
     python examples/translate_directory.py ./chapters \
         --model gpt-4o-mini --base-url https://api.openai.com/v1 --api-key sk-... --pretranslate 5 --stream
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 import time
 from collections.abc import Sequence
@@ -33,6 +35,7 @@ from wntranslate import (
     Chapter,
     Creativity,
     Message,
+    ReasoningEffort,
     TranslationResponse,
     TranslationSettings,
 )
@@ -96,12 +99,50 @@ def _nav(index: int, total: int) -> str:
     return f'<nav class="nav">{prev}<a href="/">Chapter {index + 1} / {total}</a>{nxt}</nav>'
 
 
-def _page(title: str, body: str, *, refresh: int | None = None) -> bytes:
-    meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh is not None else ""
+_WS_SCRIPT = """
+function esc(s){var d=document.createElement('div');d.textContent=(s==null?'':s);return d.innerHTML;}
+(function(){
+  function connect(){
+    var proto=(location.protocol==='https:'?'wss://':'ws://');
+    var ws=new WebSocket(proto+location.host+'/ws');
+    ws.onmessage=function(e){try{if(window.applyUpdate){window.applyUpdate(JSON.parse(e.data));}}catch(_){}};
+    ws.onclose=function(){setTimeout(connect,1000);};
+  }
+  connect();
+})();
+"""
+
+
+_TOC_SCRIPT = r"""
+window.applyUpdate = function (d) {
+  var t = document.getElementById('book-title'); if (t) { t.textContent = d.title; }
+  var syn = document.getElementById('synopsis');
+  if (syn) { syn.innerHTML = (d.synopsis || '').split('\n\n').filter(function (p) { return p.trim(); }).map(function (p) { return '<p>' + esc(p) + '</p>'; }).join(''); }
+  var ol = document.getElementById('toc');
+  if (ol) { ol.innerHTML = d.chapters.map(function (c) { return '<li><a href="/chapter/' + c.index + '">' + esc(c.title) + '</a> <span class="badge">' + esc(c.badge) + '</span></li>'; }).join(''); }
+  var rs = document.getElementById('request-status'); if (rs) { rs.textContent = d.request; }
+};
+"""
+
+_CHAPTER_SCRIPT = r"""
+var INDEX = __INDEX__, STATE = __STATE__;
+window.applyUpdate = function (d) {
+  var chap = d.chapters[INDEX];
+  if (chap && chap.state !== STATE) { location.reload(); return; }
+  var pre = document.getElementById('stream');
+  var text = d.streams[String(INDEX)];
+  if (pre && text != null) { pre.textContent = text; }
+};
+"""
+
+
+def _page(title: str, body: str, *, script: str = "") -> bytes:
+    page_script = f"<script>{script}</script>" if script else ""
     document = (
         f'<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
-        f'<meta name="viewport" content="width=device-width, initial-scale=1">{meta}'
-        f"<title>{escape(title)}</title><style>{_CSS}</style></head><body>{body}</body></html>"
+        f'<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f"<title>{escape(title)}</title><style>{_CSS}</style></head><body>{body}"
+        f"{page_script}<script>{_WS_SCRIPT}</script></body></html>"
     )
     return document.encode("utf-8")
 
@@ -159,13 +200,47 @@ class Translator:
         self.request_error: str | None = None
         self.request_result: str | None = None
         self.cond = asyncio.Condition()
+        self.listeners: set[asyncio.Event] = set()
         self._seed_from_project()
+
+    def _notify(self) -> None:
+        """Wake every connected WebSocket so it pushes a fresh snapshot."""
+        for event in self.listeners:
+            event.set()
 
     def feed_token(self, piece: str) -> None:
         """Append a streamed token to the chapter currently being translated."""
         if self._streaming is not None:
             self.stream_text[self._streaming] = self.stream_text.get(self._streaming, "") + piece
             self.token_counts[self._streaming] = self.token_counts.get(self._streaming, 0) + 1
+            self._notify()
+
+    def _request_status_text(self) -> str:
+        return {
+            "queued": "Request queued…",
+            "running": "Applying request…",
+            "done": f"Applied: {self.request_result or 'no changes'}",
+            "error": f"Request failed: {self.request_error or 'error'}",
+        }.get(self.request_status or "", "")
+
+    def snapshot(self) -> dict[str, Any]:
+        """Build the JSON state the WebSocket pushes to every page."""
+        chapters = []
+        for index in range(len(self.sources)):
+            state = self.status.get(index, "pending")
+            chapter = self.translated.get(index)
+            title = chapter.title if chapter is not None and chapter.title else self.sources[index][0]
+            chapters.append(
+                {"index": index, "title": title or f"Chapter {index + 1}", "state": state, "badge": _BADGES.get(state, "")}
+            )
+        streams = {str(index): text for index, text in self.stream_text.items()}
+        return {
+            "title": self.project.title or self.project.original_title,
+            "synopsis": self.project.synopsis or self.project.original_synopsis or "",
+            "chapters": chapters,
+            "streams": streams,
+            "request": self._request_status_text(),
+        }
 
     def start(self) -> None:
         asyncio.create_task(self._run())
@@ -176,6 +251,7 @@ class Translator:
         async with self.cond:
             self.metadata_state = "translating"
             self.cond.notify_all()
+            self._notify()
         started = time.monotonic()
         try:
             await self.project.translate_metadata()
@@ -189,6 +265,7 @@ class Translator:
         async with self.cond:
             self.metadata_state = state
             self.cond.notify_all()
+            self._notify()
 
     def _seed_from_project(self) -> None:
         claimed: set[int] = set()
@@ -209,6 +286,7 @@ class Translator:
                 if self.status.get(candidate) not in ("translating", "done") and candidate not in self.pending:
                     self.pending.add(candidate)
             self.cond.notify_all()
+            self._notify()
 
     def _next_chapter(self) -> int | None:
         if not self.pending:
@@ -228,6 +306,7 @@ class Translator:
             if self.request_status != "running":
                 self.request_status = "queued"
             self.cond.notify_all()
+            self._notify()
 
     async def _run(self) -> None:
         while True:
@@ -246,6 +325,7 @@ class Translator:
                     index = self._next_chapter()
                     assert index is not None
                     self.status[index] = "translating"
+            self._notify()
             if text is not None:
                 await self._run_request(text)
             elif index is not None:
@@ -271,23 +351,19 @@ class Translator:
                 self.request_result = result
                 print(f"Applied request in {elapsed:.1f}s ({result})", file=sys.stderr)
             self.cond.notify_all()
+            self._notify()
 
     async def _translate(self, index: int) -> None:
         title, content = self.sources[index]
         started = time.monotonic()
         error: str | None = None
         chapter: Chapter | None = None
-        before = len(self.project.chapters)
         self.stream_text[index] = ""
         self.token_counts[index] = 0
         self._streaming = index
         try:
-            await self.project.translate_new_chapter(title, content)
-            if len(self.project.chapters) > before:
-                chapter = self.project.chapters[-1]
-                self._save()
-            else:
-                error = "model returned no chapter"
+            chapter = await self.project.translate_new_chapter(title, content)
+            self._save()
         except Exception as exc:  # noqa: BLE001 - surface any failure on the chapter page
             error = str(exc)
         finally:
@@ -307,6 +383,7 @@ class Translator:
                 suffix = f" and {tokens} tokens" if tokens else ""
                 print(f"Translated chapter {index + 1} ({chapter.title or title}) in {elapsed:.1f}s{suffix}", file=sys.stderr)
             self.cond.notify_all()
+            self._notify()
 
     def _save(self) -> None:
         self.save_path.write_text(self.project.dumps(indent=4, separators=(", ", ": ")), encoding="utf-8")
@@ -323,12 +400,9 @@ class Translator:
         await self._request(index)
 
     def render_toc(self) -> bytes:
-        total = len(self.sources)
-        busy = bool(self.pending) or self.metadata_state == "translating" or self.request_status in ("queued", "running")
         items = []
-        for index in range(total):
+        for index in range(len(self.sources)):
             state = self.status.get(index, "pending")
-            busy = busy or state == "translating"
             chapter = self.translated.get(index)
             title = chapter.title if chapter is not None and chapter.title else self.sources[index][0]
             items.append(
@@ -336,32 +410,23 @@ class Translator:
                 f'<span class="badge">{_BADGES.get(state, "")}</span></li>'
             )
         heading = escape(self.project.title or self.project.original_title)
-        synopsis = self.project.synopsis or self.project.original_synopsis
-        description = ""
-        if synopsis:
-            paragraphs = "".join(f"<p>{escape(part)}</p>" for part in synopsis.split("\n\n") if part.strip())
-            description = f'<div class="synopsis">{paragraphs}</div>'
+        synopsis = self.project.synopsis or self.project.original_synopsis or ""
+        paragraphs = "".join(f"<p>{escape(part)}</p>" for part in synopsis.split("\n\n") if part.strip())
         body = (
-            f'<main class="wrap"><h1>{heading}</h1>{description}'
-            f'<ol class="toc-list">{"".join(items)}</ol>{self._render_request_box()}</main>'
+            f'<main class="wrap"><h1 id="book-title">{heading}</h1>'
+            f'<div id="synopsis" class="synopsis">{paragraphs}</div>'
+            f'<ol id="toc" class="toc-list">{"".join(items)}</ol>{self._render_request_box()}</main>'
         )
-        return _page("Contents", body, refresh=3 if busy else None)
+        return _page("Contents", body, script=_TOC_SCRIPT)
 
     def _render_request_box(self) -> str:
-        notices = {
-            "queued": '<p class="request-status">Request queued…</p>',
-            "running": '<p class="request-status">Applying request…</p>',
-            "done": f'<p class="request-status">Applied: {escape(self.request_result or "no changes")}</p>',
-            "error": f'<p class="request-status error">Request failed: {escape(self.request_error or "error")}</p>',
-        }
-        status = notices.get(self.request_status or "", "")
         return (
             '<form method="post" action="/request" class="request">'
             '<label for="request">Request a change (glossary edit, retitle, add a note, reorder, …)</label>'
             '<textarea id="request" name="request" rows="3" '
             'placeholder="e.g. Rename the protagonist to Iroha everywhere and note that the tone is comedic."></textarea>'
             "<button>Submit request</button>"
-            f"{status}</form>"
+            f'<p id="request-status" class="request-status">{escape(self._request_status_text())}</p></form>'
         )
 
     async def render_chapter(self, index: int) -> bytes:
@@ -371,6 +436,7 @@ class Translator:
             state = self.status.get(index, "pending")
             chapter = self.translated.get(index)
             error = self.errors.get(index)
+        script = _CHAPTER_SCRIPT.replace("__INDEX__", str(index)).replace("__STATE__", json.dumps(state))
         if state == "done" and chapter is not None:
             body = render_content_html(chapter.content, self.project.glossary)
             heading = escape(chapter.title or f"Chapter {index + 1}")
@@ -378,19 +444,38 @@ class Translator:
                 f'<form method="post" action="/chapter/{index}/retranslate" class="retranslate">'
                 f"<button>Retranslate</button></form>"
             )
-            return _page(heading, f'{_nav(index, total)}<main class="wrap"><h1>{heading}</h1>{body}{retranslate}</main>')
-        partial = self.stream_text.get(index)
-        stream = f'<pre class="stream">{escape(partial)}</pre>' if partial else ""
+            inner = f'{_nav(index, total)}<main class="wrap"><h1>{heading}</h1>{body}{retranslate}</main>'
+            return _page(heading, inner, script=script)
+        stream = f'<pre id="stream" class="stream">{escape(self.stream_text.get(index, ""))}</pre>'
         if state == "error":
             message = f'<p class="status error">{escape(error or "error")}</p>'
-            return _page(f"Chapter {index + 1}", f'{_nav(index, total)}<main class="wrap">{message}{stream}</main>')
+            return _page(f"Chapter {index + 1}", f'{_nav(index, total)}<main class="wrap">{message}{stream}</main>', script=script)
         message = f'<p class="status">Translating chapter {index + 1}…</p>'
-        return _page(f"Chapter {index + 1}", f'{_nav(index, total)}<main class="wrap">{message}{stream}</main>', refresh=2)
+        return _page(f"Chapter {index + 1}", f'{_nav(index, total)}<main class="wrap">{message}{stream}</main>', script=script)
 
 
 async def _toc(request: web.Request) -> web.Response:
     translator: Translator = request.app["translator"]
     return web.Response(body=translator.render_toc(), content_type="text/html", charset="utf-8")
+
+
+async def _ws(request: web.Request) -> web.WebSocketResponse:
+    translator: Translator = request.app["translator"]
+    ws = web.WebSocketResponse(heartbeat=30)
+    await ws.prepare(request)
+    event = asyncio.Event()
+    translator.listeners.add(event)
+    try:
+        await ws.send_json(translator.snapshot())
+        while not ws.closed:
+            await event.wait()
+            event.clear()
+            await ws.send_json(translator.snapshot())
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass
+    finally:
+        translator.listeners.discard(event)
+    return ws
 
 
 async def _submit_request(request: web.Request) -> web.Response:
@@ -430,6 +515,12 @@ def main() -> int:
     parser.add_argument("--base-url", default=None, help="API base URL (required unless the provider supplies one)")
     parser.add_argument("--api-key", default=None, help="API key (omit for endpoints that need none)")
     parser.add_argument("--timeout", type=float, default=600.0, help="Request timeout in seconds (0 for no limit)")
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=["off", *(effort.value for effort in ReasoningEffort)],
+        default=ReasoningEffort.LOW.value,
+        help="Reasoning effort to request; 'off' omits the field for endpoints that reject it",
+    )
     parser.add_argument("--source-language", default="Japanese")
     parser.add_argument("--target-language", default="English")
     parser.add_argument("--additional-context", default=None)
@@ -449,6 +540,7 @@ def main() -> int:
         "api_key": args.api_key,
         "timeout": args.timeout if args.timeout > 0 else None,
         "stream": args.stream,
+        "reasoning_effort": None if args.reasoning_effort == "off" else ReasoningEffort(args.reasoning_effort),
     }
     if args.base_url is not None:
         provider_kwargs["base_url"] = args.base_url
@@ -491,6 +583,7 @@ def main() -> int:
     app.add_routes(
         [
             web.get("/", _toc),
+            web.get("/ws", _ws),
             web.post("/request", _submit_request),
             web.get("/chapter/{index}", _chapter),
             web.post("/chapter/{index}/retranslate", _retranslate),

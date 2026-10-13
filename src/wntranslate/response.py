@@ -182,9 +182,10 @@ class GlossaryUpdate:
 class ChapterTranslation:
     """A translated chapter payload returned by the model.
 
+    The source title and text are not part of the model's output; they are supplied by
+    the caller of translate_new_chapter, or kept from the existing chapter on a revision.
+
     Args:
-        original_title: Title in the source language.
-        original_content: Raw source text.
         title: Translated title.
         content: Translated content nodes.
         kind: Kind of unit.
@@ -193,8 +194,6 @@ class ChapterTranslation:
         position: Index to place the chapter at, or None to keep or append.
     """
 
-    original_title: str = ""
-    original_content: str = ""
     title: str = ""
     content: Content = field(default_factory=Content)
     kind: ChapterKind = ChapterKind.CHAPTER
@@ -202,15 +201,19 @@ class ChapterTranslation:
     target_id: str | None = None
     position: int | None = None
 
-    def to_chapter(self) -> Chapter:
-        """Build a chapter from this payload.
+    def to_chapter(self, original_title: str = "", original_content: str = "") -> Chapter:
+        """Build a chapter from this payload and the given source title and text.
+
+        Args:
+            original_title: Source-language title to store on the chapter.
+            original_content: Raw source text to store on the chapter.
 
         Returns:
             The new chapter.
         """
         return Chapter(
-            original_title=self.original_title,
-            original_content=self.original_content,
+            original_title=original_title,
+            original_content=original_content,
             title=self.title,
             content=self.content,
             kind=self.kind,
@@ -224,8 +227,6 @@ class ChapterTranslation:
             A JSON-compatible representation.
         """
         return {
-            "original_title": self.original_title,
-            "original_content": self.original_content,
             "title": self.title,
             "content": self.content.to_dict(),
             "kind": self.kind.value,
@@ -245,8 +246,6 @@ class ChapterTranslation:
             The reconstructed payload.
         """
         return cls(
-            original_title=data.get("original_title", ""),
-            original_content=data.get("original_content", ""),
             title=data.get("title", ""),
             content=Content.from_dict(data.get("content", {})),
             kind=ChapterKind(data.get("kind", ChapterKind.CHAPTER.value)),
@@ -298,11 +297,13 @@ class TranslationResponse:
         chapters: Translated chapters.
         glossary_updates: Glossary additions, edits, and deletions.
         context: Running context update, or None.
+        more: True when the model has further changes it could not fit and wants to continue.
     """
 
     chapters: list[ChapterTranslation] = field(default_factory=list)
     glossary_updates: list[GlossaryUpdate] = field(default_factory=list)
     context: ContextUpdate | None = None
+    more: bool = False
 
     response_type: ClassVar[ResponseType] = ResponseType.TRANSLATION
 
@@ -317,6 +318,7 @@ class TranslationResponse:
             "chapters": [chapter.to_dict() for chapter in self.chapters],
             "glossary_updates": [update.to_dict() for update in self.glossary_updates],
             "context": self.context.to_dict() if self.context is not None else None,
+            "more": self.more,
         }
 
     @classmethod
@@ -332,6 +334,186 @@ class TranslationResponse:
         context = data.get("context")
         return cls(
             chapters=[ChapterTranslation.from_dict(chapter) for chapter in data.get("chapters", [])],
+            glossary_updates=[GlossaryUpdate.from_dict(update) for update in data.get("glossary_updates", [])],
+            context=ContextUpdate.from_dict(context) if context is not None else None,
+            more=bool(data.get("more", False)),
+        )
+
+
+@dataclass
+class ChapterAnalysis:
+    """First-pass result: glossary and context changes plus this chapter's metadata.
+
+    Args:
+        summary: Short summary of the chapter, or None.
+        kind: Kind of unit (chapter, announcement, post, or other).
+        glossary_updates: Glossary additions, edits, and deletions.
+        context: Running context update, or None.
+    """
+
+    summary: str | None = None
+    kind: ChapterKind = ChapterKind.CHAPTER
+    glossary_updates: list[GlossaryUpdate] = field(default_factory=list)
+    context: ContextUpdate | None = None
+
+    response_type: ClassVar[ResponseType] = ResponseType.ANALYSIS
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a plain dict.
+
+        Returns:
+            A JSON-compatible representation.
+        """
+        return {
+            "response_type": self.response_type.value,
+            "kind": self.kind.value,
+            "summary": self.summary,
+            "glossary_updates": [update.to_dict() for update in self.glossary_updates],
+            "context": self.context.to_dict() if self.context is not None else None,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ChapterAnalysis:
+        """Rebuild from a dict representation.
+
+        Args:
+            data: A dict produced by to_dict.
+
+        Returns:
+            The reconstructed analysis.
+        """
+        context = data.get("context")
+        return cls(
+            summary=data.get("summary"),
+            kind=ChapterKind(data.get("kind", ChapterKind.CHAPTER.value)),
+            glossary_updates=[GlossaryUpdate.from_dict(update) for update in data.get("glossary_updates", [])],
+            context=ContextUpdate.from_dict(context) if context is not None else None,
+        )
+
+
+@dataclass
+class ChapterDraft:
+    """Second-pass result: the translated title and content for a new chapter.
+
+    Args:
+        title: Translated title.
+        content: Translated content nodes.
+        position: Index to place the chapter at, or None to append.
+    """
+
+    title: str = ""
+    content: Content = field(default_factory=Content)
+    position: int | None = None
+
+    response_type: ClassVar[ResponseType] = ResponseType.TRANSLATION
+
+    def to_chapter(
+        self,
+        original_title: str = "",
+        original_content: str = "",
+        kind: ChapterKind = ChapterKind.CHAPTER,
+        summary: str | None = None,
+    ) -> Chapter:
+        """Build a chapter from this draft and the analysis metadata.
+
+        Args:
+            original_title: Source-language title to store on the chapter.
+            original_content: Raw source text to store on the chapter.
+            kind: Kind of unit, from the analysis pass.
+            summary: Chapter summary, from the analysis pass.
+
+        Returns:
+            The new chapter.
+        """
+        return Chapter(
+            original_title=original_title,
+            original_content=original_content,
+            title=self.title,
+            content=self.content,
+            kind=kind,
+            summary=summary,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a plain dict.
+
+        Returns:
+            A JSON-compatible representation.
+        """
+        return {
+            "response_type": self.response_type.value,
+            "title": self.title,
+            "content": self.content.to_dict(),
+            "position": self.position,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ChapterDraft:
+        """Rebuild from a dict representation.
+
+        Args:
+            data: A dict produced by to_dict.
+
+        Returns:
+            The reconstructed draft.
+        """
+        return cls(
+            title=data.get("title", ""),
+            content=Content.from_dict(data.get("content", {})),
+            position=data.get("position"),
+        )
+
+
+@dataclass
+class ChapterCleanup:
+    """Third-pass result: the reviewed translation plus optional fixes to pass-1 glossary/context.
+
+    Args:
+        title: Corrected translated title.
+        content: Corrected translated content nodes.
+        position: Index to place the chapter at, or None to append.
+        glossary_updates: Corrections to glossary entries the analysis pass got wrong.
+        context: Corrections to the notes or running summary, or None to leave them.
+    """
+
+    title: str = ""
+    content: Content = field(default_factory=Content)
+    position: int | None = None
+    glossary_updates: list[GlossaryUpdate] = field(default_factory=list)
+    context: ContextUpdate | None = None
+
+    response_type: ClassVar[ResponseType] = ResponseType.TRANSLATION
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a plain dict.
+
+        Returns:
+            A JSON-compatible representation.
+        """
+        return {
+            "response_type": self.response_type.value,
+            "title": self.title,
+            "content": self.content.to_dict(),
+            "position": self.position,
+            "glossary_updates": [update.to_dict() for update in self.glossary_updates],
+            "context": self.context.to_dict() if self.context is not None else None,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ChapterCleanup:
+        """Rebuild from a dict representation.
+
+        Args:
+            data: A dict produced by to_dict.
+
+        Returns:
+            The reconstructed cleanup.
+        """
+        context = data.get("context")
+        return cls(
+            title=data.get("title", ""),
+            content=Content.from_dict(data.get("content", {})),
+            position=data.get("position"),
             glossary_updates=[GlossaryUpdate.from_dict(update) for update in data.get("glossary_updates", [])],
             context=ContextUpdate.from_dict(context) if context is not None else None,
         )
@@ -442,7 +624,13 @@ def _glossary_update_schema() -> dict[str, Any]:
             "specified_type": {"type": "string"},
         },
         "allOf": [
-            {"if": {"properties": {"op": {"const": "new"}}}, "then": {"required": ["name", "original_name", "type"]}},
+            {
+                "if": {"properties": {"op": {"const": "new"}}},
+                "then": {
+                    "required": ["name", "original_name", "type"],
+                    "properties": {"name": {"minLength": 1}, "original_name": {"minLength": 1}},
+                },
+            },
             {
                 "if": {"properties": {"op": {"const": "edit"}}},
                 "then": {"required": ["target_id"], "properties": {"target_id": {"type": "string"}}},
@@ -452,6 +640,26 @@ def _glossary_update_schema() -> dict[str, Any]:
                 "then": {"required": ["target_id"], "properties": {"target_id": {"type": "string"}}},
             },
         ],
+    }
+
+
+def _context_schema() -> dict[str, Any]:
+    return {
+        "type": ["object", "null"],
+        "additionalProperties": False,
+        "properties": {
+            "summary": {"type": ["string", "null"]},
+            "notes": {"type": ["array", "null"], "items": {"type": "string"}},
+        },
+    }
+
+
+def _content_schema(create_footnotes: bool) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "required": ["nodes"],
+        "additionalProperties": False,
+        "properties": {"nodes": {"type": "array", "items": _node_schema(create_footnotes)}},
     }
 
 
@@ -465,32 +673,16 @@ def response_schema(settings: TranslationSettings) -> dict[str, Any]:
         A JSON schema.
     """
     chapter_properties: dict[str, Any] = {
-        "original_title": {"type": "string"},
-        "original_content": {"type": "string"},
         "title": {"type": "string"},
-        "content": {
-            "type": "object",
-            "required": ["nodes"],
-            "additionalProperties": False,
-            "properties": {"nodes": {"type": "array", "items": _node_schema(settings.create_footnotes)}},
-        },
+        "content": _content_schema(settings.create_footnotes),
         "kind": {"type": "string", "enum": [kind.value for kind in ChapterKind]},
         "target_id": {"type": ["string", "null"]},
         "position": {"type": ["integer", "null"]},
     }
-    chapter_required = ["original_title", "original_content", "title", "content"]
+    chapter_required = ["title", "content"]
     if settings.generate_chapter_summaries:
         chapter_properties["summary"] = {"type": "string"}
         chapter_required.append("summary")
-
-    context_schema: dict[str, Any] = {
-        "type": ["object", "null"],
-        "additionalProperties": False,
-        "properties": {
-            "summary": {"type": ["string", "null"]},
-            "notes": {"type": ["array", "null"], "items": {"type": "string"}},
-        },
-    }
 
     return {
         "type": "object",
@@ -508,7 +700,76 @@ def response_schema(settings: TranslationSettings) -> dict[str, Any]:
                 },
             },
             "glossary_updates": {"type": "array", "items": _glossary_update_schema()},
-            "context": context_schema,
+            "context": _context_schema(),
+            "more": {"type": "boolean"},
+        },
+    }
+
+
+def analysis_schema(settings: TranslationSettings) -> dict[str, Any]:
+    """Build the JSON schema for the first pass: glossary, context, and chapter metadata.
+
+    Args:
+        settings: The settings that shape the schema.
+
+    Returns:
+        A JSON schema.
+    """
+    properties: dict[str, Any] = {
+        "response_type": {"type": "string", "enum": [ResponseType.ANALYSIS.value]},
+        "kind": {"type": "string", "enum": [kind.value for kind in ChapterKind]},
+        "glossary_updates": {"type": "array", "items": _glossary_update_schema()},
+        "context": _context_schema(),
+    }
+    required = ["response_type", "kind", "glossary_updates", "context"]
+    if settings.generate_chapter_summaries:
+        properties["summary"] = {"type": "string"}
+        required.append("summary")
+    return {"type": "object", "required": required, "additionalProperties": False, "properties": properties}
+
+
+def chapter_draft_schema(settings: TranslationSettings) -> dict[str, Any]:
+    """Build the JSON schema for the second pass: the translated title and content.
+
+    Args:
+        settings: The settings that shape the schema.
+
+    Returns:
+        A JSON schema.
+    """
+    return {
+        "type": "object",
+        "required": ["response_type", "title", "content"],
+        "additionalProperties": False,
+        "properties": {
+            "response_type": {"type": "string", "enum": [ResponseType.TRANSLATION.value]},
+            "title": {"type": "string"},
+            "content": _content_schema(settings.create_footnotes),
+            "position": {"type": ["integer", "null"]},
+        },
+    }
+
+
+def cleanup_schema(settings: TranslationSettings) -> dict[str, Any]:
+    """Build the JSON schema for the third pass: the reviewed translation plus optional fixes.
+
+    Args:
+        settings: The settings that shape the schema.
+
+    Returns:
+        A JSON schema.
+    """
+    return {
+        "type": "object",
+        "required": ["response_type", "title", "content"],
+        "additionalProperties": False,
+        "properties": {
+            "response_type": {"type": "string", "enum": [ResponseType.TRANSLATION.value]},
+            "title": {"type": "string"},
+            "content": _content_schema(settings.create_footnotes),
+            "position": {"type": ["integer", "null"]},
+            "glossary_updates": {"type": "array", "items": _glossary_update_schema()},
+            "context": _context_schema(),
         },
     }
 
@@ -523,3 +784,81 @@ def output_schema(settings: TranslationSettings) -> dict[str, Any]:
         A JSON schema with a top-level oneOf.
     """
     return {"oneOf": [request_schema(), response_schema(settings)]}
+
+
+def analysis_output_schema(settings: TranslationSettings) -> dict[str, Any]:
+    """Build the first-pass schema allowing either a data request or an analysis.
+
+    Args:
+        settings: The settings that shape the analysis schema.
+
+    Returns:
+        A JSON schema with a top-level oneOf.
+    """
+    return {"oneOf": [request_schema(), analysis_schema(settings)]}
+
+
+def draft_output_schema(settings: TranslationSettings) -> dict[str, Any]:
+    """Build the second-pass schema allowing either a data request or a chapter draft.
+
+    Args:
+        settings: The settings that shape the draft schema.
+
+    Returns:
+        A JSON schema with a top-level oneOf.
+    """
+    return {"oneOf": [request_schema(), chapter_draft_schema(settings)]}
+
+
+def cleanup_output_schema(settings: TranslationSettings) -> dict[str, Any]:
+    """Build the third-pass schema allowing either a data request or a chapter cleanup.
+
+    Args:
+        settings: The settings that shape the cleanup schema.
+
+    Returns:
+        A JSON schema with a top-level oneOf.
+    """
+    return {"oneOf": [request_schema(), cleanup_schema(settings)]}
+
+
+def parse_analysis(data: dict[str, Any]) -> TranslationRequest | ChapterAnalysis:
+    """Parse first-pass model JSON as a data request or a chapter analysis.
+
+    Args:
+        data: The decoded model output.
+
+    Returns:
+        A TranslationRequest when response_type is 'request', otherwise a ChapterAnalysis.
+    """
+    if ResponseType(data["response_type"]) is ResponseType.REQUEST:
+        return TranslationRequest.from_dict(data)
+    return ChapterAnalysis.from_dict(data)
+
+
+def parse_draft(data: dict[str, Any]) -> TranslationRequest | ChapterDraft:
+    """Parse second-pass model JSON as a data request or a chapter draft.
+
+    Args:
+        data: The decoded model output.
+
+    Returns:
+        A TranslationRequest when response_type is 'request', otherwise a ChapterDraft.
+    """
+    if ResponseType(data["response_type"]) is ResponseType.REQUEST:
+        return TranslationRequest.from_dict(data)
+    return ChapterDraft.from_dict(data)
+
+
+def parse_cleanup(data: dict[str, Any]) -> TranslationRequest | ChapterCleanup:
+    """Parse third-pass model JSON as a data request or a chapter cleanup.
+
+    Args:
+        data: The decoded model output.
+
+    Returns:
+        A TranslationRequest when response_type is 'request', otherwise a ChapterCleanup.
+    """
+    if ResponseType(data["response_type"]) is ResponseType.REQUEST:
+        return TranslationRequest.from_dict(data)
+    return ChapterCleanup.from_dict(data)

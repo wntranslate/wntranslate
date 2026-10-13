@@ -1,6 +1,12 @@
 # WNTranslate
 Simple yet comprehensive AI-assisted webnovel translation tool. Keeps track of the plot properly to ensure smooth translation.
 
+Tested with local llama.cpp self-hosted Qwen3.6 35B A3B model, and Deepseek V4.1 Flash. I recommend using this library with a provider that supports `json_schema` (which Deepseek does not support) although Deepseek worked decently well.
+
+A high parameter model is recommended to understand the prompt and properly apply translations. This library uses a four-pass system (analyze, translate, review, apply glossary) every single translation, and thinking mode is recommended to be OFF (`ReasoningEffort.NONE`) or LOW (`ReasoningEffort.LOW`), otherwise each chapter will take a lot of time.
+
+It takes under 60s to translate a single chapter (standard length) using Deepseek V4.1 Flash with no reasoning, costing under $0.02 per chapter.
+
 ### Features
 - **Glossary** for consistent naming across chapters:
   - typed entries (person, item, organization, creative work, or a custom type)
@@ -10,7 +16,8 @@ Simple yet comprehensive AI-assisted webnovel translation tool. Keeps track of t
   - rolling summary plus freeform notes
   - optional per-chapter summaries that the AI can reference
 - **Settings-driven prompt and response schema** to regenerate from your options: source/target language, creativity, footnotes, context mode, chapter summaries, and glossary/reorder permissions and limits.
-- **Structured model protocol** - the model either returns a translation (glossary add/edit/delete, chapter reordering, and context changes apply straight back into the project) or requests data it still needs, such as the chapter list or another chapter's text.
+- **Structured model protocol** - glossary add/edit/delete, chapter reordering, and context changes apply straight back into the project, and the model can request data it still needs (the chapter list, another chapter's text, …), which is fulfilled automatically:
+  - new chapters translate in two passes within one conversation: first the glossary, notes, and running summary are settled, then the translation is produced against the finalized names
 - **HTML output** for a full reader (table of contents, prev/next arrows, keyboard navigation) or a single standalone chapter, with Markdown and jump-to/jump-back footnotes rendered.
 - **Versioned project files** - the whole project can save and load as JSON.
 
@@ -38,13 +45,10 @@ wn.translate_metadata()
 
 The model is always given the glossary and your project notes, and it can request the synopsis, titles, or other chapters' text when it needs them. Notes hold project-wide facts that must stay perfectly consistent across every chapter (and that aren't glossary terms or story summary); the model keeps them updated, or you can steer them with `request_change`.
 
-Translate a new chapter. The response is validated against the generated schema and applied to the project; if the model needs more information first, it returns a request to fulfill and retry:
+Translate a new chapter. This runs in two passes within one conversation: first the model updates the glossary, notes, and running summary and classifies the chapter; then, with the finalized glossary, it produces the translation. Every response is validated against the generated schema, and any data the model requests (another chapter's text, the synopsis, …) is auto-fulfilled. The newly added chapter is returned:
 ```python
-from wntranslate import TranslationRequest
-
-result = wn.translate_new_chapter(original_title="第1話", original_content="<source text>")
-if isinstance(result, TranslationRequest):
-    answers = wn.resolve_request(result)   # look up what it asked for, then call again
+chapter = wn.translate_new_chapter(original_title="第1話", original_content="<source text>")
+print(chapter.title)
 ```
 
 Ask for a specific change in plain language; it is applied and returned:

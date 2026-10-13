@@ -185,6 +185,8 @@ def test_glossary_update_schema_requires_fields() -> None:
     assert valid({"op": "new", "name": "Iroha", "original_name": "イロハ", "type": "person"})
     assert not valid({"op": "new", "name": "Iroha", "type": "person"})  # missing original_name
     assert not valid({"op": "new", "original_name": "イロハ", "type": "person"})  # missing name
+    assert not valid({"op": "new", "name": "", "original_name": "イロハ", "type": "person"})  # blank name
+    assert not valid({"op": "new", "name": "Iroha", "original_name": "", "type": "person"})  # blank original_name
     assert valid({"op": "delete", "target_id": "abc"})
     assert not valid({"op": "delete", "target_id": None})  # delete needs a real id
     assert not valid({"op": "edit", "name": "x"})  # edit needs target_id

@@ -8,7 +8,7 @@ from typing import Any
 import aiohttp
 
 from .base import AsyncProvider, Message
-from .openai import ProviderError, _build_body, _delta
+from .openai import ProviderError, ReasoningEffort, _build_body, _delta
 
 
 @dataclass
@@ -23,6 +23,7 @@ class AsyncOpenAIProvider(AsyncProvider):
         temperature: Sampling temperature, or None to use the API default.
         supports_schema: Whether the API supports a json_schema response_format;
             when False, the schema is added to the prompt and JSON mode is used.
+        reasoning_effort: Reasoning effort to request, or None to omit the field.
         headers: Extra headers to send.
         stream: Whether to stream the response (and call on_token per piece).
         on_token: Callback invoked with each streamed text piece.
@@ -34,6 +35,7 @@ class AsyncOpenAIProvider(AsyncProvider):
     timeout: float | None = 600.0
     temperature: float | None = 0.3
     supports_schema: bool = True
+    reasoning_effort: ReasoningEffort | None = ReasoningEffort.LOW
     headers: dict[str, str] = field(default_factory=dict)
     stream: bool = False
     on_token: Callable[[str], None] | None = None
@@ -116,7 +118,9 @@ class AsyncOpenAIProvider(AsyncProvider):
         response_format: dict[str, Any] | None,
         extra_body: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        return _build_body(self.model, messages, response_format, self.temperature, self.supports_schema, extra_body)
+        return _build_body(
+            self.model, messages, response_format, self.temperature, self.supports_schema, self.reasoning_effort, extra_body
+        )
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json", **self.headers}

@@ -8,32 +8,47 @@ import jsonschema
 
 from ._version import __version__
 from .chapter import Chapter
+from .content import TermNode
 from .context import Context
 from .enums import ContextType, GlossaryOp, RequestKind
 from .glossary import Glossary
-from .prompts import generate_metadata_prompt
+from .prompts import (
+    generate_analysis_prompt,
+    generate_chapter_prompt,
+    generate_cleanup_prompt,
+    generate_linking_prompt,
+    generate_metadata_prompt,
+    generate_translation_prompt,
+)
 from .providers import AsyncProvider, Message, Provider, json_schema_format
 from .render import chapter_document, reader_document, render_content_html
 from .request import DataRequest, DataResult, TranslationRequest
 from .response import (
+    ChapterAnalysis,
+    ChapterCleanup,
+    ChapterDraft,
     ChapterTranslation,
+    ContextUpdate,
     GlossaryUpdate,
     TranslatedMetadata,
     TranslationResponse,
+    analysis_output_schema,
+    cleanup_output_schema,
+    draft_output_schema,
     metadata_schema,
     output_schema,
+    parse_analysis,
+    parse_cleanup,
+    parse_draft,
     parse_model_output,
 )
 from .settings import TranslationSettings
 
 _MAX_REQUEST_ROUNDS = 8
 _MAX_SCHEMA_RETRIES = 3
+_MAX_CONTINUATION_ROUNDS = 100
 
 _T = TypeVar("_T")
-
-
-def _chapter_prompt(original_title: str, original_content: str) -> str:
-    return f"Translate this new chapter.\n\nTitle:\n{original_title}\n\nContent:\n{original_content}"
 
 
 def _schema_message(schema: dict[str, Any]) -> Message:
@@ -123,16 +138,18 @@ class _BaseWebNovel:
         self.chapters = chapters if chapters is not None else []
         self.context = Context()
 
-    def apply_response(self, response: TranslationResponse) -> None:
+    def apply_response(self, response: TranslationResponse, original_title: str = "", original_content: str = "") -> None:
         """Apply a translation response, updating glossary, chapters, and context.
 
         Args:
             response: The parsed response.
+            original_title: Source title to store on any newly added chapter.
+            original_content: Source text to store on any newly added chapter.
         """
         for update in response.glossary_updates:
             self._apply_glossary_update(update)
         for payload in response.chapters:
-            self._apply_chapter(payload)
+            self._apply_chapter(payload, original_title, original_content)
         if response.context is not None:
             if response.context.summary is not None:
                 self.context.summary = response.context.summary
@@ -309,13 +326,61 @@ class _BaseWebNovel:
             Message(role="user", content=user),
         ]
 
+    def _chapter_system(self) -> list[Message]:
+        return [
+            Message(role="system", content=generate_chapter_prompt(self.settings)),
+            Message(role="system", content="Project state (JSON):\n" + json.dumps(self._state(), ensure_ascii=False)),
+        ]
+
+    def _analysis_user(self, original_title: str, original_content: str) -> str:
+        return f"Analyze this new chapter.\n\nTitle:\n{original_title}\n\nContent:\n{original_content}"
+
+    def _draft_user(self) -> str:
+        return "Now translate this chapter, using the finalized glossary in the updated project state above."
+
+    def _cleanup_user(self) -> str:
+        return "Review the translation you just produced and return the corrected chapter."
+
+    def _linking_user(self) -> str:
+        return "Now link the glossary names in the chapter you just produced, changing nothing else."
+
+    def _apply_glossary_and_context(self, glossary_updates: list[GlossaryUpdate], context: ContextUpdate | None) -> None:
+        self._check_glossary_policy(glossary_updates)
+        for update in glossary_updates:
+            self._apply_glossary_update(update)
+        if context is not None:
+            if context.summary is not None:
+                self.context.summary = context.summary
+            if context.notes is not None:
+                self.context.notes = list(context.notes)
+
+    def _apply_analysis(self, analysis: ChapterAnalysis) -> None:
+        self._apply_glossary_and_context(analysis.glossary_updates, analysis.context)
+
+    def _apply_cleanup(self, cleanup: ChapterCleanup) -> None:
+        self._apply_glossary_and_context(cleanup.glossary_updates, cleanup.context)
+
+    def _merge_response(self, merged: TranslationResponse, response: TranslationResponse) -> None:
+        merged.chapters.extend(response.chapters)
+        merged.glossary_updates.extend(response.glossary_updates)
+        if response.context is not None:
+            merged.context = response.context
+
+    def _apply_draft(
+        self, draft: ChapterDraft, original_title: str, original_content: str, analysis: ChapterAnalysis
+    ) -> Chapter:
+        if not self.settings.allow_chapter_reorder and draft.position is not None:
+            raise TranslationError("chapter reorder not allowed")
+        chapter = draft.to_chapter(original_title, original_content, analysis.kind, analysis.summary)
+        if draft.position is None:
+            self.chapters.append(chapter)
+        else:
+            self.chapters.insert(draft.position, chapter)
+        return chapter
+
     def _parse_metadata(self, raw: str) -> TranslatedMetadata:
         data = self._validate(raw, metadata_schema())
         return TranslatedMetadata.from_dict(data)
-
-    def _parse_output(self, raw: str) -> TranslationRequest | TranslationResponse:
-        data = self._validate(raw, output_schema(self.settings))
-        return parse_model_output(data)
 
     def _validate(self, raw: str, schema: dict[str, Any]) -> Any:
         try:
@@ -328,18 +393,10 @@ class _BaseWebNovel:
             raise _SchemaError(error.message) from error
         return data
 
-    def _finish_translation(self, response: TranslationResponse, original_title: str, original_content: str) -> None:
-        for payload in response.chapters:
-            if payload.target_id is None:
-                payload.original_title = original_title
-                payload.original_content = original_content
-        self._check_policy(response)
-        self.apply_response(response)
-
-    def _check_policy(self, response: TranslationResponse) -> None:
+    def _check_glossary_policy(self, updates: list[GlossaryUpdate]) -> None:
         settings = self.settings
         counts = {GlossaryOp.NEW: 0, GlossaryOp.EDIT: 0, GlossaryOp.DELETE: 0}
-        for update in response.glossary_updates:
+        for update in updates:
             counts[update.op] += 1
         checks = [
             (GlossaryOp.NEW, "add", settings.allow_glossary_add, settings.glossary_add_limit),
@@ -351,7 +408,44 @@ class _BaseWebNovel:
                 raise TranslationError(f"glossary {action} not allowed")
             if counts[op] > limit:
                 raise TranslationError(f"exceeds glossary {action} limit: {limit}")
-        if not settings.allow_chapter_reorder and any(payload.position is not None for payload in response.chapters):
+        self._check_glossary_references(updates)
+
+    def _referenced_ids(self) -> tuple[set[str], set[str]]:
+        """Collect glossary entry ids and alias ids referenced by any chapter's content.
+
+        Returns:
+            A (term ids, alias ids) pair of everything chapters currently point at.
+        """
+        term_ids: set[str] = set()
+        alias_ids: set[str] = set()
+        for chapter in self.chapters:
+            for node in chapter.content.nodes:
+                if isinstance(node, TermNode):
+                    term_ids.add(node.term_id)
+                    if node.alias_id is not None:
+                        alias_ids.add(node.alias_id)
+        return term_ids, alias_ids
+
+    def _check_glossary_references(self, updates: list[GlossaryUpdate]) -> None:
+        term_ids, alias_ids = self._referenced_ids()
+        for update in updates:
+            if update.target_id is None:
+                continue
+            entry = self.glossary.get(update.target_id)
+            if update.op is GlossaryOp.DELETE and update.target_id in term_ids:
+                raise TranslationError(f"cannot delete glossary entry in use by a chapter: {update.target_id}")
+            if update.op is GlossaryOp.EDIT and entry is not None:
+                kept = {suggestion.original for suggestion in update.aliases}
+                if any(alias.id in alias_ids and alias.original not in kept for alias in entry.aliases):
+                    raise TranslationError(f"cannot drop glossary alias in use by a chapter: {update.target_id}")
+
+    def _check_policy(self, response: TranslationResponse) -> None:
+        self._check_glossary_policy(response.glossary_updates)
+        ids = {chapter.id for chapter in self.chapters}
+        for payload in response.chapters:
+            if payload.target_id is not None and payload.target_id not in ids:
+                raise TranslationError(f"unknown chapter target_id: {payload.target_id}")
+        if not self.settings.allow_chapter_reorder and any(payload.position is not None for payload in response.chapters):
             raise TranslationError("chapter reorder not allowed")
 
     def _apply_glossary_update(self, update: GlossaryUpdate) -> None:
@@ -364,10 +458,10 @@ class _BaseWebNovel:
         else:
             self.glossary.add(update.to_entry())
 
-    def _apply_chapter(self, payload: ChapterTranslation) -> None:
+    def _apply_chapter(self, payload: ChapterTranslation, original_title: str = "", original_content: str = "") -> None:
         existing = next((c for c in self.chapters if c.id == payload.target_id), None) if payload.target_id else None
         if existing is None:
-            chapter = payload.to_chapter()
+            chapter = payload.to_chapter(original_title, original_content)
             if payload.position is None:
                 self.chapters.append(chapter)
             else:
@@ -453,19 +547,97 @@ class WebNovel(_BaseWebNovel):
             raise TypeError("WebNovel needs a synchronous Provider; use AsyncWebNovel for an AsyncProvider")
         self.provider = provider
 
-    def translate_new_chapter(self, original_title: str, original_content: str) -> TranslationResponse:
-        """Translate a new chapter and apply it, auto-fulfilling any data requests.
+    def translate_new_chapter(self, original_title: str, original_content: str) -> Chapter:
+        """Translate a new chapter in four passes within one conversation and apply it.
+
+        Pass 1 stages glossary, notes, and running-summary updates plus the chapter's kind and
+        summary; pass 2 produces the translation using that staged state; pass 3 reviews and
+        fixes it (and may correct pass-1 glossary or context mistakes); pass 4 links glossary
+        names in the content to their entries by id. Data requests in any pass are
+        auto-fulfilled. Nothing is committed to the project until every pass succeeds — on any
+        failure the project is left unchanged.
 
         Args:
             original_title: Source-language title.
             original_content: Raw source text.
 
         Returns:
-            The applied translation.
+            The newly added chapter.
         """
-        response = self._resolve_until_response(_chapter_prompt(original_title, original_content))
-        self._finish_translation(response, original_title, original_content)
-        return response
+        committed = False
+        restore_glossary, restore_context = self.glossary, self.context
+        self.glossary = Glossary.from_dict(self.glossary.to_dict())
+        self.context = Context.from_dict(self.context.to_dict())
+        try:
+            conversation = self._chapter_system()
+            analysis_schema = analysis_output_schema(self.settings)
+            conversation.append(Message(role="system", content=generate_analysis_prompt(self.settings)))
+            conversation.append(_schema_message(analysis_schema))
+            conversation.append(Message(role="user", content=self._analysis_user(original_title, original_content)))
+            analysis = self._ask(conversation, analysis_schema, parse_analysis)
+            self._apply_analysis(analysis)
+
+            draft_schema = draft_output_schema(self.settings)
+            conversation.append(
+                Message(role="system", content="Updated project state (JSON):\n" + json.dumps(self._state(), ensure_ascii=False))
+            )
+            conversation.append(Message(role="system", content=generate_translation_prompt(self.settings)))
+            conversation.append(_schema_message(draft_schema))
+            conversation.append(Message(role="user", content=self._draft_user()))
+            self._ask(conversation, draft_schema, parse_draft)  # the draft stays in the conversation for pass 3 to review
+
+            cleanup_schema = cleanup_output_schema(self.settings)
+            conversation.append(Message(role="system", content=generate_cleanup_prompt(self.settings)))
+            conversation.append(_schema_message(cleanup_schema))
+            conversation.append(Message(role="user", content=self._cleanup_user()))
+            cleanup = self._ask(conversation, cleanup_schema, parse_cleanup)
+            self._apply_cleanup(cleanup)
+
+            conversation.append(
+                Message(role="system", content="Updated project state (JSON):\n" + json.dumps(self._state(), ensure_ascii=False))
+            )
+            conversation.append(Message(role="system", content=generate_linking_prompt(self.settings)))
+            conversation.append(_schema_message(draft_schema))
+            conversation.append(Message(role="user", content=self._linking_user()))
+            linked = self._ask(conversation, draft_schema, parse_draft)
+
+            chapter = self._apply_draft(linked, original_title, original_content, analysis)
+            committed = True
+            return chapter
+        finally:
+            if not committed:
+                self.glossary, self.context = restore_glossary, restore_context
+
+    def _ask(
+        self, conversation: list[Message], schema: dict[str, Any], parse: Callable[[Any], TranslationRequest | _T]
+    ) -> _T:
+        if self.provider is None:
+            raise TranslationError("no provider configured")
+        fmt = json_schema_format("wntranslate", schema)
+        rounds = _MAX_REQUEST_ROUNDS
+        schema_retries = _MAX_SCHEMA_RETRIES
+        while True:
+            raw = self.provider.complete(conversation, response_format=fmt)
+            conversation.append(Message(role="assistant", content=raw))
+            try:
+                data = self._validate(raw, schema)
+            except _SchemaError as error:
+                if schema_retries <= 0:
+                    raise TranslationError("response schema invalid") from error
+                schema_retries -= 1
+                conversation.append(Message(role="system", content=_schema_correction(error.detail)))
+                continue
+            result = parse(data)
+            if isinstance(result, TranslationRequest):
+                rounds -= 1
+                if rounds <= 0:
+                    raise TranslationError("model kept requesting data")
+                fulfilled = [item.to_dict() for item in self.resolve_request(result)]
+                conversation.append(
+                    Message(role="system", content="Data you requested (JSON):\n" + json.dumps(fulfilled, ensure_ascii=False))
+                )
+                continue
+            return result
 
     def translate_metadata(self) -> TranslatedMetadata:
         """Translate the webnovel's title and synopsis and apply them.
@@ -483,28 +655,32 @@ class WebNovel(_BaseWebNovel):
         return metadata
 
     def request_change(self, request: str) -> TranslationResponse:
-        """Ask for a specific change and apply it, auto-fulfilling any data requests.
+        """Ask for a change and apply it, auto-fulfilling data requests and continuing if asked.
+
+        If the model has more changes than fit in one response it sets ``more`` and is prompted
+        to continue; each batch is applied as it arrives. The returned response is the union of
+        every applied batch.
 
         Args:
             request: A free-form description of the change, e.g. a glossary edit.
 
         Returns:
-            The applied change.
+            The applied change(s).
         """
-        response = self._resolve_until_response(request)
-        self._check_policy(response)
-        self.apply_response(response)
-        return response
-
-    def _resolve_until_response(self, user: str) -> TranslationResponse:
-        fmt = json_schema_format("wntranslate", output_schema(self.settings))
-        fulfilled: list[dict[str, Any]] = []
-        for _ in range(_MAX_REQUEST_ROUNDS):
-            result = self._complete_parsed(self._messages(user, fulfilled), fmt, self._parse_output)
-            if isinstance(result, TranslationResponse):
-                return result
-            fulfilled.extend(item.to_dict() for item in self.resolve_request(result))
-        raise TranslationError("model kept requesting data")
+        schema = output_schema(self.settings)
+        conversation = self._messages(request, [])
+        merged = TranslationResponse()
+        for _ in range(_MAX_CONTINUATION_ROUNDS):
+            response = self._ask(conversation, schema, parse_model_output)
+            self._check_policy(response)
+            self.apply_response(response)
+            self._merge_response(merged, response)
+            if not response.more:
+                return merged
+            conversation.append(
+                Message(role="user", content="Continue with the remaining changes; set more to false once none are left.")
+            )
+        raise TranslationError("too many continuation rounds")
 
     def _complete_parsed(self, messages: list[Message], fmt: dict[str, Any], parse: Callable[[str], _T]) -> _T:
         if self.provider is None:
@@ -565,19 +741,97 @@ class AsyncWebNovel(_BaseWebNovel):
             raise TypeError("AsyncWebNovel needs an AsyncProvider; use WebNovel for a synchronous Provider")
         self.provider = provider
 
-    async def translate_new_chapter(self, original_title: str, original_content: str) -> TranslationResponse:
-        """Translate a new chapter and apply it, auto-fulfilling any data requests.
+    async def translate_new_chapter(self, original_title: str, original_content: str) -> Chapter:
+        """Translate a new chapter in four passes within one conversation and apply it.
+
+        Pass 1 stages glossary, notes, and running-summary updates plus the chapter's kind and
+        summary; pass 2 produces the translation using that staged state; pass 3 reviews and
+        fixes it (and may correct pass-1 glossary or context mistakes); pass 4 links glossary
+        names in the content to their entries by id. Data requests in any pass are
+        auto-fulfilled. Nothing is committed to the project until every pass succeeds — on any
+        failure the project is left unchanged.
 
         Args:
             original_title: Source-language title.
             original_content: Raw source text.
 
         Returns:
-            The applied translation.
+            The newly added chapter.
         """
-        response = await self._resolve_until_response(_chapter_prompt(original_title, original_content))
-        self._finish_translation(response, original_title, original_content)
-        return response
+        committed = False
+        restore_glossary, restore_context = self.glossary, self.context
+        self.glossary = Glossary.from_dict(self.glossary.to_dict())
+        self.context = Context.from_dict(self.context.to_dict())
+        try:
+            conversation = self._chapter_system()
+            analysis_schema = analysis_output_schema(self.settings)
+            conversation.append(Message(role="system", content=generate_analysis_prompt(self.settings)))
+            conversation.append(_schema_message(analysis_schema))
+            conversation.append(Message(role="user", content=self._analysis_user(original_title, original_content)))
+            analysis = await self._ask(conversation, analysis_schema, parse_analysis)
+            self._apply_analysis(analysis)
+
+            draft_schema = draft_output_schema(self.settings)
+            conversation.append(
+                Message(role="system", content="Updated project state (JSON):\n" + json.dumps(self._state(), ensure_ascii=False))
+            )
+            conversation.append(Message(role="system", content=generate_translation_prompt(self.settings)))
+            conversation.append(_schema_message(draft_schema))
+            conversation.append(Message(role="user", content=self._draft_user()))
+            await self._ask(conversation, draft_schema, parse_draft)  # the draft stays in the conversation for pass 3
+
+            cleanup_schema = cleanup_output_schema(self.settings)
+            conversation.append(Message(role="system", content=generate_cleanup_prompt(self.settings)))
+            conversation.append(_schema_message(cleanup_schema))
+            conversation.append(Message(role="user", content=self._cleanup_user()))
+            cleanup = await self._ask(conversation, cleanup_schema, parse_cleanup)
+            self._apply_cleanup(cleanup)
+
+            conversation.append(
+                Message(role="system", content="Updated project state (JSON):\n" + json.dumps(self._state(), ensure_ascii=False))
+            )
+            conversation.append(Message(role="system", content=generate_linking_prompt(self.settings)))
+            conversation.append(_schema_message(draft_schema))
+            conversation.append(Message(role="user", content=self._linking_user()))
+            linked = await self._ask(conversation, draft_schema, parse_draft)
+
+            chapter = self._apply_draft(linked, original_title, original_content, analysis)
+            committed = True
+            return chapter
+        finally:
+            if not committed:
+                self.glossary, self.context = restore_glossary, restore_context
+
+    async def _ask(
+        self, conversation: list[Message], schema: dict[str, Any], parse: Callable[[Any], TranslationRequest | _T]
+    ) -> _T:
+        if self.provider is None:
+            raise TranslationError("no provider configured")
+        fmt = json_schema_format("wntranslate", schema)
+        rounds = _MAX_REQUEST_ROUNDS
+        schema_retries = _MAX_SCHEMA_RETRIES
+        while True:
+            raw = await self.provider.complete(conversation, response_format=fmt)
+            conversation.append(Message(role="assistant", content=raw))
+            try:
+                data = self._validate(raw, schema)
+            except _SchemaError as error:
+                if schema_retries <= 0:
+                    raise TranslationError("response schema invalid") from error
+                schema_retries -= 1
+                conversation.append(Message(role="system", content=_schema_correction(error.detail)))
+                continue
+            result = parse(data)
+            if isinstance(result, TranslationRequest):
+                rounds -= 1
+                if rounds <= 0:
+                    raise TranslationError("model kept requesting data")
+                fulfilled = [item.to_dict() for item in self.resolve_request(result)]
+                conversation.append(
+                    Message(role="system", content="Data you requested (JSON):\n" + json.dumps(fulfilled, ensure_ascii=False))
+                )
+                continue
+            return result
 
     async def translate_metadata(self) -> TranslatedMetadata:
         """Translate the webnovel's title and synopsis and apply them.
@@ -595,28 +849,32 @@ class AsyncWebNovel(_BaseWebNovel):
         return metadata
 
     async def request_change(self, request: str) -> TranslationResponse:
-        """Ask for a specific change and apply it, auto-fulfilling any data requests.
+        """Ask for a change and apply it, auto-fulfilling data requests and continuing if asked.
+
+        If the model has more changes than fit in one response it sets ``more`` and is prompted
+        to continue; each batch is applied as it arrives. The returned response is the union of
+        every applied batch.
 
         Args:
             request: A free-form description of the change, e.g. a glossary edit.
 
         Returns:
-            The applied change.
+            The applied change(s).
         """
-        response = await self._resolve_until_response(request)
-        self._check_policy(response)
-        self.apply_response(response)
-        return response
-
-    async def _resolve_until_response(self, user: str) -> TranslationResponse:
-        fmt = json_schema_format("wntranslate", output_schema(self.settings))
-        fulfilled: list[dict[str, Any]] = []
-        for _ in range(_MAX_REQUEST_ROUNDS):
-            result = await self._complete_parsed(self._messages(user, fulfilled), fmt, self._parse_output)
-            if isinstance(result, TranslationResponse):
-                return result
-            fulfilled.extend(item.to_dict() for item in self.resolve_request(result))
-        raise TranslationError("model kept requesting data")
+        schema = output_schema(self.settings)
+        conversation = self._messages(request, [])
+        merged = TranslationResponse()
+        for _ in range(_MAX_CONTINUATION_ROUNDS):
+            response = await self._ask(conversation, schema, parse_model_output)
+            self._check_policy(response)
+            self.apply_response(response)
+            self._merge_response(merged, response)
+            if not response.more:
+                return merged
+            conversation.append(
+                Message(role="user", content="Continue with the remaining changes; set more to false once none are left.")
+            )
+        raise TranslationError("too many continuation rounds")
 
     async def _complete_parsed(self, messages: list[Message], fmt: dict[str, Any], parse: Callable[[str], _T]) -> _T:
         if self.provider is None:

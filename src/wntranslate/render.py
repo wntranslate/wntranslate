@@ -7,7 +7,7 @@ from markdown_it import MarkdownIt
 from .content import Content, TermNode, TextNode
 from .glossary import Glossary
 
-_MD = MarkdownIt("commonmark", {"html": False}).enable(["table", "strikethrough"])
+_MD = MarkdownIt("commonmark", {"html": False, "breaks": True}).enable(["table", "strikethrough"]).disable("blockquote")
 
 _STYLE = """
 :root { color-scheme: light dark; --fg: #1a1a1a; --bg: #fdfdfc; --muted: #666; --accent: #3b5bdb; --rule: #e3e3e0; }

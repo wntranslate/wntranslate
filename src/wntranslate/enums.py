@@ -49,6 +49,7 @@ class RequestKind(Enum):
 
 class ResponseType(Enum):
     REQUEST = "request"
+    ANALYSIS = "analysis"
     TRANSLATION = "translation"
 
 

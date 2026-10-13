@@ -7,8 +7,15 @@ import jsonschema
 import pytest
 
 from wntranslate import (
+    Alias,
+    AliasSuggestion,
     AsyncProvider,
     AsyncWebNovel,
+    Chapter,
+    ChapterAnalysis,
+    ChapterCleanup,
+    ChapterDraft,
+    ChapterKind,
     ChapterTranslation,
     Content,
     ContextUpdate,
@@ -21,6 +28,7 @@ from wntranslate import (
     PersonEntry,
     Provider,
     RequestKind,
+    TermNode,
     TextNode,
     TranslationError,
     TranslationRequest,
@@ -67,8 +75,21 @@ class FakeAsyncProvider(AsyncProvider):
         return reply
 
 
-def _dump(obj: TranslationResponse | TranslationRequest) -> str:
+def _dump(obj: TranslationResponse | TranslationRequest | ChapterAnalysis | ChapterDraft) -> str:
     return json.dumps(obj.to_dict())
+
+
+def _analysis(
+    summary: str | None = "s",
+    kind: ChapterKind = ChapterKind.CHAPTER,
+    glossary_updates: list[GlossaryUpdate] | None = None,
+    context: ContextUpdate | None = None,
+) -> str:
+    return _dump(ChapterAnalysis(summary=summary, kind=kind, glossary_updates=glossary_updates or [], context=context))
+
+
+def _draft(title: str = "Ch1", text: str = "hi", position: int | None = None) -> str:
+    return _dump(ChapterDraft(title=title, content=Content(nodes=[TextNode(text=text)]), position=position))
 
 
 def test_no_provider() -> None:
@@ -84,46 +105,26 @@ def test_provider_type_mismatch() -> None:
 
 
 def test_translate_new_chapter_applies() -> None:
-    reply = TranslationResponse(
-        chapters=[
-            ChapterTranslation(
-                original_title="x",
-                original_content="y",
-                title="Ch1",
-                content=Content(nodes=[TextNode(text="hi")]),
-                summary="s",
-            )
-        ],
-        context=ContextUpdate(summary="recap"),
-    )
-    wn = WebNovel("src", "", provider=FakeProvider(_dump(reply)))
+    provider = FakeProvider([_analysis(summary="s", context=ContextUpdate(summary="recap")), _draft(title="Ch1")])
+    wn = WebNovel("src", "", provider=provider)
     result = wn.translate_new_chapter("原題", "原文")
-    assert isinstance(result, TranslationResponse)
+    assert isinstance(result, Chapter)
+    assert provider.calls == 4
     assert len(wn.chapters) == 1
     assert wn.chapters[0].title == "Ch1"
     assert wn.chapters[0].original_title == "原題"
     assert wn.chapters[0].original_content == "原文"
+    assert wn.chapters[0].summary == "s"
     assert wn.context.summary == "recap"
 
 
 def test_translate_new_chapter_auto_fulfills_requests() -> None:
     request = TranslationRequest(requests=[DataRequest(kind=RequestKind.CHAPTER_LIST)])
-    response = TranslationResponse(
-        chapters=[
-            ChapterTranslation(
-                original_title="x",
-                original_content="y",
-                title="Ch1",
-                content=Content(nodes=[TextNode(text="hi")]),
-                summary="s",
-            )
-        ]
-    )
-    provider = FakeProvider([_dump(request), _dump(response)])
+    provider = FakeProvider([_dump(request), _analysis(), _draft(title="Ch1")])
     wn = WebNovel("src", "", provider=provider)
     result = wn.translate_new_chapter("t", "c")
-    assert isinstance(result, TranslationResponse)
-    assert provider.calls == 2
+    assert isinstance(result, Chapter)
+    assert provider.calls == 5
     assert len(wn.chapters) == 1
     requested = next(m.content for m in provider.last_messages if m.content.startswith("Data you requested"))
     assert "chapter_list" in requested
@@ -151,6 +152,125 @@ def test_request_change_glossary_edit() -> None:
     assert edited.name == "Ayame"
 
 
+def test_request_change_unknown_target_id_errors() -> None:
+    wn = WebNovel("src", "")
+    wn.chapters.append(
+        Chapter(original_title="o", original_content="c", title="old", content=Content(nodes=[TextNode(text="old")]))
+    )
+    reply = TranslationResponse(
+        chapters=[
+            ChapterTranslation(title="new", content=Content(nodes=[TextNode(text="new")]), summary="", target_id="chapter_1")
+        ]
+    )
+    wn.provider = FakeProvider(_dump(reply))
+    with pytest.raises(TranslationError, match="unknown chapter target_id"):
+        wn.request_change("revise chapter 1")
+    assert len(wn.chapters) == 1
+    assert wn.chapters[0].title == "old"
+
+
+def test_request_change_valid_target_id_revises() -> None:
+    wn = WebNovel("src", "")
+    wn.chapters.append(
+        Chapter(original_title="o", original_content="c", title="old", content=Content(nodes=[TextNode(text="old")]))
+    )
+    reply = TranslationResponse(
+        chapters=[
+            ChapterTranslation(
+                title="new", content=Content(nodes=[TextNode(text="new")]), summary="", target_id=wn.chapters[0].id
+            )
+        ]
+    )
+    wn.provider = FakeProvider(_dump(reply))
+    wn.request_change("revise it")
+    assert len(wn.chapters) == 1
+    assert wn.chapters[0].title == "new"
+
+
+def test_request_change_continues_until_done() -> None:
+    wn = WebNovel("src", "")
+    for i in range(4):
+        wn.chapters.append(
+            Chapter(
+                original_title=f"o{i}",
+                original_content=f"c{i}",
+                title=f"old{i}",
+                content=Content(nodes=[TextNode(text=f"old{i}")]),
+                summary="",
+            )
+        )
+
+    def edit(i: int) -> ChapterTranslation:
+        return ChapterTranslation(
+            title=f"new{i}", content=Content(nodes=[TextNode(text=f"n{i}")]), summary="", target_id=wn.chapters[i].id
+        )
+
+    batch1 = TranslationResponse(chapters=[edit(0), edit(1)], more=True)
+    batch2 = TranslationResponse(chapters=[edit(2), edit(3)], more=False)
+    provider = FakeProvider([_dump(batch1), _dump(batch2)])
+    wn.provider = provider
+    result = wn.request_change("update all four chapters")
+    assert provider.calls == 2
+    assert [c.title for c in wn.chapters] == ["new0", "new1", "new2", "new3"]
+    assert len(result.chapters) == 4
+    assert any(m.role == "user" and "Continue" in m.content for m in provider.last_messages)
+
+
+def _chapter_using(person: PersonEntry, *, alias: bool = False) -> Chapter:
+    alias_id = person.aliases[0].id if alias else None
+    return Chapter(
+        original_title="o",
+        original_content="c",
+        title="C1",
+        content=Content(nodes=[TermNode(term_id=person.id, alias_id=alias_id)]),
+    )
+
+
+def test_cannot_delete_referenced_glossary_entry() -> None:
+    wn = WebNovel("src", "")
+    person = PersonEntry(name="Ayami")
+    wn.glossary.add(person)
+    wn.chapters.append(_chapter_using(person))
+    wn.provider = FakeProvider(_dump(TranslationResponse(glossary_updates=[GlossaryUpdate(op=GlossaryOp.DELETE, target_id=person.id)])))
+    with pytest.raises(TranslationError, match="in use by a chapter"):
+        wn.request_change("delete Ayami")
+    assert len(wn.glossary) == 1
+
+
+def test_cannot_drop_referenced_alias_via_edit() -> None:
+    wn = WebNovel("src", "")
+    person = PersonEntry(name="Ayami", aliases=[Alias(original="彩-", translation="Aya-")])
+    wn.glossary.add(person)
+    wn.chapters.append(_chapter_using(person, alias=True))
+    reply = TranslationResponse(
+        glossary_updates=[GlossaryUpdate(op=GlossaryOp.EDIT, target_id=person.id, name="Ayame", type=NameType.PERSON)]
+    )
+    wn.provider = FakeProvider(_dump(reply))
+    with pytest.raises(TranslationError, match="drop glossary alias in use"):
+        wn.request_change("rename")
+
+
+def test_edit_keeping_referenced_alias_ok() -> None:
+    wn = WebNovel("src", "")
+    person = PersonEntry(name="Ayami", aliases=[Alias(original="彩-", translation="Aya-")])
+    wn.glossary.add(person)
+    wn.chapters.append(_chapter_using(person, alias=True))
+    reply = TranslationResponse(
+        glossary_updates=[
+            GlossaryUpdate(
+                op=GlossaryOp.EDIT,
+                target_id=person.id,
+                name="Ayame",
+                type=NameType.PERSON,
+                aliases=[AliasSuggestion(original="彩-", translation="Aya-")],
+            )
+        ]
+    )
+    wn.provider = FakeProvider(_dump(reply))
+    wn.request_change("rename")
+    assert wn.chapters[0].render(wn.glossary) == "Aya-"
+
+
 def test_schema_invalid_structure() -> None:
     wn = WebNovel("src", "", provider=FakeProvider(json.dumps({"foo": "bar"})))
     with pytest.raises(TranslationError, match="response schema invalid"):
@@ -164,22 +284,11 @@ def test_schema_invalid_bad_json() -> None:
 
 
 def test_schema_retry_then_succeeds() -> None:
-    response = TranslationResponse(
-        chapters=[
-            ChapterTranslation(
-                original_title="x",
-                original_content="y",
-                title="Ch1",
-                content=Content(nodes=[TextNode(text="hi")]),
-                summary="s",
-            )
-        ]
-    )
-    provider = FakeProvider(["not json", _dump(response)])
+    provider = FakeProvider(["not json", _analysis(), _draft(title="Ch1")])
     wn = WebNovel("src", "", provider=provider)
     result = wn.translate_new_chapter("t", "c")
-    assert isinstance(result, TranslationResponse)
-    assert provider.calls == 2
+    assert isinstance(result, Chapter)
+    assert provider.calls == 5
     assert len(wn.chapters) == 1
     assert any(m.role == "assistant" and m.content == "not json" for m in provider.last_messages)
     assert any("did not match" in m.content for m in provider.last_messages)
@@ -193,22 +302,8 @@ def test_schema_retry_gives_up_after_limit() -> None:
     assert provider.calls == 4
 
 
-def _one_chapter_response() -> TranslationResponse:
-    return TranslationResponse(
-        chapters=[
-            ChapterTranslation(
-                original_title="x",
-                original_content="y",
-                title="Ch1",
-                content=Content(nodes=[TextNode(text="hi")]),
-                summary="s",
-            )
-        ]
-    )
-
-
 def test_full_schema_is_sent_to_the_model() -> None:
-    provider = FakeProvider(_dump(_one_chapter_response()))
+    provider = FakeProvider([_analysis(), _draft()])
     wn = WebNovel("src", "", provider=provider)
     wn.translate_new_chapter("t", "c")
     assert any(
@@ -217,8 +312,51 @@ def test_full_schema_is_sent_to_the_model() -> None:
     )
 
 
+def test_cleanup_pass_can_fix_glossary_and_context() -> None:
+    cleanup = ChapterCleanup(
+        title="Ch1",
+        content=Content(nodes=[TextNode(text="hi")]),
+        glossary_updates=[GlossaryUpdate(op=GlossaryOp.NEW, name="Iroha", original_name="イロハ", type=NameType.PERSON)],
+        context=ContextUpdate(notes=["keep X"]),
+    )
+    provider = FakeProvider([_analysis(), _draft(), _dump(cleanup), _draft()])
+    wn = WebNovel("src", "", provider=provider)
+    wn.translate_new_chapter("t", "c")
+    assert provider.calls == 4
+    assert len(wn.glossary) == 1
+    assert wn.context.notes == ["keep X"]
+    assert len(wn.chapters) == 1
+
+
+def test_fourth_pass_links_glossary_terms() -> None:
+    wn = WebNovel("src", "")
+    person = PersonEntry(name="Iroha")
+    wn.glossary.add(person)
+    linked = ChapterDraft(title="Ch1", content=Content(nodes=[TextNode(text="Hi "), TermNode(term_id=person.id)]))
+    provider = FakeProvider([_analysis(), _draft(), _draft(), _dump(linked)])
+    wn.provider = provider
+    chapter = wn.translate_new_chapter("t", "c")
+    assert provider.calls == 4
+    assert any(isinstance(node, TermNode) and node.term_id == person.id for node in chapter.content.nodes)
+    assert chapter.render(wn.glossary) == "Hi Iroha"
+
+
+def test_failed_translation_rolls_back_staged_changes() -> None:
+    analysis = _analysis(
+        glossary_updates=[GlossaryUpdate(op=GlossaryOp.NEW, name="Iroha", original_name="イロハ", type=NameType.PERSON)],
+        context=ContextUpdate(notes=["staged note"]),
+    )
+    provider = FakeProvider([analysis, "not json"])
+    wn = WebNovel("src", "", provider=provider)
+    with pytest.raises(TranslationError):
+        wn.translate_new_chapter("t", "c")
+    assert len(wn.glossary) == 0
+    assert wn.context.notes == []
+    assert len(wn.chapters) == 0
+
+
 def test_schema_error_names_the_real_problem_not_the_wrong_branch() -> None:
-    bad = json.loads(_dump(_one_chapter_response()))
+    bad = json.loads(_analysis())
     bad["type"] = "json_object"
     provider = FakeProvider(json.dumps(bad))
     wn = WebNovel("src", "", provider=provider)
@@ -232,8 +370,8 @@ def test_schema_error_names_the_real_problem_not_the_wrong_branch() -> None:
 def test_glossary_add_limit() -> None:
     reply = TranslationResponse(
         glossary_updates=[
-            GlossaryUpdate(op=GlossaryOp.NEW, name="A", type=NameType.PERSON),
-            GlossaryUpdate(op=GlossaryOp.NEW, name="B", type=NameType.PERSON),
+            GlossaryUpdate(op=GlossaryOp.NEW, name="A", original_name="あ", type=NameType.PERSON),
+            GlossaryUpdate(op=GlossaryOp.NEW, name="B", original_name="い", type=NameType.PERSON),
         ]
     )
     wn = WebNovel("src", "", settings=TranslationSettings(glossary_add_limit=1), provider=FakeProvider(_dump(reply)))
@@ -243,7 +381,7 @@ def test_glossary_add_limit() -> None:
 
 
 def test_glossary_add_not_allowed() -> None:
-    reply = TranslationResponse(glossary_updates=[GlossaryUpdate(op=GlossaryOp.NEW, name="A", type=NameType.PERSON)])
+    reply = TranslationResponse(glossary_updates=[GlossaryUpdate(op=GlossaryOp.NEW, name="A", original_name="あ", type=NameType.PERSON)])
     wn = WebNovel("src", "", settings=TranslationSettings(allow_glossary_add=False), provider=FakeProvider(_dump(reply)))
     with pytest.raises(TranslationError, match="glossary add not allowed"):
         wn.request_change("x")
@@ -253,8 +391,6 @@ def test_chapter_reorder_not_allowed() -> None:
     reply = TranslationResponse(
         chapters=[
             ChapterTranslation(
-                original_title="o",
-                original_content="c",
                 title="t",
                 content=Content(nodes=[TextNode(text="x")]),
                 summary="",
@@ -303,48 +439,26 @@ def test_resolve_webnovel_fields() -> None:
 
 def test_async_webnovel_translate_and_auto_fulfill() -> None:
     request = TranslationRequest(requests=[DataRequest(kind=RequestKind.CHAPTER_LIST)])
-    response = TranslationResponse(
-        chapters=[
-            ChapterTranslation(
-                original_title="x",
-                original_content="y",
-                title="Ch1",
-                content=Content(nodes=[TextNode(text="hi")]),
-                summary="s",
-            )
-        ]
-    )
-    provider = FakeAsyncProvider([_dump(request), _dump(response)])
+    provider = FakeAsyncProvider([_dump(request), _analysis(), _draft(title="Ch1")])
     wn = AsyncWebNovel("src", "", provider=provider)
     result = asyncio.run(wn.translate_new_chapter("t", "c"))
-    assert isinstance(result, TranslationResponse)
-    assert provider.calls == 2
+    assert isinstance(result, Chapter)
+    assert provider.calls == 5
     assert len(wn.chapters) == 1
     assert wn.chapters[0].original_title == "t"
 
 
 def test_settings_change_applies_next_translation() -> None:
-    response = TranslationResponse(
-        chapters=[
-            ChapterTranslation(
-                original_title="x",
-                original_content="y",
-                title="t",
-                content=Content(nodes=[TextNode(text="hi")]),
-                summary="s",
-            )
-        ]
-    )
-    provider = FakeProvider([_dump(response), _dump(response)])
+    provider = FakeProvider([_analysis(), _draft(), _draft(), _draft(), _analysis(), _draft(), _draft(), _draft()])
     wn = WebNovel("src", "", provider=provider)
 
     wn.settings.creativity = Creativity.VERY_LOW
     wn.translate_new_chapter("a", "b")
-    low_prompt = provider.last_messages[0].content
+    low_prompt = "\n".join(m.content for m in provider.last_messages)
 
     wn.settings.creativity = Creativity.VERY_HIGH
     wn.translate_new_chapter("c", "d")
-    high_prompt = provider.last_messages[0].content
+    high_prompt = "\n".join(m.content for m in provider.last_messages)
 
     assert "as literally as fidelity allows" in low_prompt
     assert "Freely polish" in high_prompt
@@ -371,14 +485,12 @@ def test_response_to_dict_matches_schema() -> None:
     reply = TranslationResponse(
         chapters=[
             ChapterTranslation(
-                original_title="o",
-                original_content="c",
                 title="t",
                 content=Content(nodes=[TextNode(text="x")]),
                 summary="s",
             )
         ],
-        glossary_updates=[GlossaryUpdate(op=GlossaryOp.NEW, name="A", type=NameType.PERSON)],
+        glossary_updates=[GlossaryUpdate(op=GlossaryOp.NEW, name="A", original_name="あ", type=NameType.PERSON)],
         context=ContextUpdate(summary="z", notes=["n"]),
     )
     jsonschema.validate(reply.to_dict(), response_schema(TranslationSettings()))

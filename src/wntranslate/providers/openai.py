@@ -5,6 +5,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 from .base import Message, Provider
@@ -12,6 +13,26 @@ from .base import Message, Provider
 
 class ProviderError(RuntimeError):
     """Raised when a provider request fails."""
+
+
+class ReasoningEffort(Enum):
+    """Reasoning effort for an OpenAI-compatible model, sent as the `reasoning_effort` field.
+
+    The level is passed through to the API verbatim; each endpoint accepts only some of these
+    and may reject or silently ignore the rest, so treat support as a best guess. NONE, LOW,
+    HIGH, and MAX tend to be the most broadly accepted; MEDIUM is accepted by OpenAI and
+    llama.cpp's server; MINIMAL and XHIGH are OpenAI-specific (MINIMAL is the lowest reasoning
+    level, just below LOW). Set a provider's reasoning_effort to None instead of a member to
+    omit the field entirely, for endpoints that do not accept it at all.
+    """
+
+    NONE = "none"
+    MINIMAL = "minimal"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"
+    MAX = "max"
 
 
 @dataclass
@@ -26,6 +47,7 @@ class OpenAIProvider(Provider):
         temperature: Sampling temperature, or None to use the API default.
         supports_schema: Whether the API supports a json_schema response_format;
             when False, the schema is added to the prompt and JSON mode is used.
+        reasoning_effort: Reasoning effort to request, or None to omit the field.
         headers: Extra headers to send.
         stream: Whether to stream the response (and call on_token per piece).
         on_token: Callback invoked with each streamed text piece.
@@ -37,6 +59,7 @@ class OpenAIProvider(Provider):
     timeout: float | None = 600.0
     temperature: float | None = 0.3
     supports_schema: bool = True
+    reasoning_effort: ReasoningEffort | None = ReasoningEffort.LOW
     headers: dict[str, str] = field(default_factory=dict)
     stream: bool = False
     on_token: Callable[[str], None] | None = None
@@ -58,7 +81,9 @@ class OpenAIProvider(Provider):
         Returns:
             The assistant message content.
         """
-        body = _build_body(self.model, messages, response_format, self.temperature, self.supports_schema, extra_body)
+        body = _build_body(
+            self.model, messages, response_format, self.temperature, self.supports_schema, self.reasoning_effort, extra_body
+        )
         if self.stream:
             return self._stream(body)
         payload = self._post(body)
@@ -142,6 +167,7 @@ def _build_body(
     response_format: dict[str, Any] | None,
     temperature: float | None,
     supports_schema: bool,
+    reasoning_effort: ReasoningEffort | None,
     extra_body: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Build the chat completion request body.
@@ -158,6 +184,8 @@ def _build_body(
             body["response_format"] = response_format
     if temperature is not None:
         body["temperature"] = temperature
+    if reasoning_effort is not None:
+        body["reasoning_effort"] = reasoning_effort.value
     if extra_body:
         body.update(extra_body)
     return body
