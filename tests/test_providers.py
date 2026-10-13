@@ -11,7 +11,9 @@ from wntranslate import (
     DeepSeekProvider,
     Message,
     OpenAIProvider,
+    ProviderConnectionError,
     ProviderError,
+    ProviderHTTPError,
     ReasoningEffort,
     Usage,
     json_schema_format,
@@ -183,12 +185,22 @@ def test_no_api_key_omits_authorization(monkeypatch: pytest.MonkeyPatch) -> None
     assert "Authorization" not in captured["headers"]
 
 
-def test_http_error_raises_provider_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_http_error_raises_provider_http_error(monkeypatch: pytest.MonkeyPatch) -> None:
     def boom(request: urllib.request.Request, timeout: float | None = None) -> _FakeResponse:
         raise urllib.error.HTTPError(request.full_url, 429, "Too Many Requests", {}, io.BytesIO(b"slow down"))  # type: ignore[arg-type]
 
     monkeypatch.setattr(urllib.request, "urlopen", boom)
-    with pytest.raises(ProviderError, match="429"):
+    with pytest.raises(ProviderHTTPError, match="429") as info:
+        OpenAIProvider(model="gpt-x").complete([Message(role="user", content="hi")])
+    assert info.value.status == 429
+
+
+def test_connection_error_raises_provider_connection_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(request: urllib.request.Request, timeout: float | None = None) -> _FakeResponse:
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    with pytest.raises(ProviderConnectionError):
         OpenAIProvider(model="gpt-x").complete([Message(role="user", content="hi")])
 
 

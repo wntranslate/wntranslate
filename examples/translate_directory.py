@@ -22,10 +22,10 @@ import asyncio
 import json
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from html import escape
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from aiohttp import web
 
@@ -35,6 +35,8 @@ from wntranslate import (
     Chapter,
     Creativity,
     Message,
+    ProviderConnectionError,
+    ProviderHTTPError,
     ReasoningEffort,
     TranslationResponse,
     TranslationSettings,
@@ -80,6 +82,12 @@ body { margin: 0; background: #fdfdfc; color: #1a1a1a; font-family: Georgia, ser
 """
 
 _BADGES = {"done": "done", "translating": "translating…", "error": "failed", "pending": ""}
+
+_CONNECTION_RETRIES = 5
+_BACKOFF_BASE = 1.0
+_BACKOFF_MAX = 30.0
+
+_T = TypeVar("_T")
 
 
 def load_chapter(path: Path) -> tuple[str, str]:
@@ -214,9 +222,28 @@ class Translator:
         self.request_status: str | None = None
         self.request_error: str | None = None
         self.request_result: str | None = None
+        self.halted = False
+        self.halt_reason: str | None = None
         self.cond = asyncio.Condition()
         self.listeners: set[asyncio.Event] = set()
         self._seed_from_project()
+
+    async def _run_with_retry(self, make: Callable[[], Awaitable[_T]]) -> _T:
+        """Await make(), retrying connection failures with backoff; other errors propagate.
+
+        Connection failures are transient, so they are retried. A ProviderHTTPError (a non-200
+        such as an auth or quota error) is not retried — it propagates so the caller can halt.
+        """
+        for attempt in range(_CONNECTION_RETRIES + 1):
+            try:
+                return await make()
+            except ProviderConnectionError as exc:
+                if attempt >= _CONNECTION_RETRIES:
+                    raise
+                delay = min(_BACKOFF_BASE * 2**attempt, _BACKOFF_MAX)
+                print(f"Connection error (attempt {attempt + 1}); retrying in {delay:.0f}s: {exc}", file=sys.stderr)
+                await asyncio.sleep(delay)
+        raise AssertionError("unreachable")
 
     def _notify(self) -> None:
         """Wake every connected WebSocket so it pushes a fresh snapshot."""
@@ -241,6 +268,8 @@ class Translator:
             self.usage[self._streaming] = self.usage.get(self._streaming, Usage()) + usage
 
     def _request_status_text(self) -> str:
+        if self.halted:
+            return f"Stopped: {self.halt_reason or 'provider error'}. Fix it, then Retranslate a chapter to resume."
         return {
             "queued": "Request queued…",
             "running": "Applying request…",
@@ -278,9 +307,14 @@ class Translator:
             self.cond.notify_all()
             self._notify()
         started = time.monotonic()
+        halt_reason: str | None = None
         try:
-            await self.project.translate_metadata()
+            await self._run_with_retry(self.project.translate_metadata)
             self._save()
+        except ProviderHTTPError as exc:
+            state = "error"
+            halt_reason = str(exc)
+            print(f"Failed metadata translation after {time.monotonic() - started:.1f}s: {exc}", file=sys.stderr)
         except Exception as exc:  # noqa: BLE001 - surface any failure and keep serving
             state = "error"
             print(f"Failed metadata translation after {time.monotonic() - started:.1f}s: {exc}", file=sys.stderr)
@@ -289,6 +323,8 @@ class Translator:
             print(f"Translated metadata in {time.monotonic() - started:.1f}s", file=sys.stderr)
         async with self.cond:
             self.metadata_state = state
+            if halt_reason is not None:
+                self._mark_halted(halt_reason)
             self.cond.notify_all()
             self._notify()
 
@@ -305,10 +341,12 @@ class Translator:
 
     async def _request(self, index: int) -> None:
         async with self.cond:
+            if self.halted:
+                return
             self.requested = index
             last = len(self.sources) - 1
             for candidate in range(index, min(index + self.pretranslate, last) + 1):
-                if self.status.get(candidate) not in ("translating", "done") and candidate not in self.pending:
+                if self.status.get(candidate) not in ("translating", "done", "error") and candidate not in self.pending:
                     self.pending.add(candidate)
             self.cond.notify_all()
             self._notify()
@@ -338,7 +376,7 @@ class Translator:
             text: str | None = None
             index: int | None = None
             async with self.cond:
-                while not self.requests and not self.pending:
+                while self.halted or (not self.requests and not self.pending):
                     await self.cond.wait()
                 if self.requests:
                     text = self.requests.pop(0)
@@ -360,11 +398,15 @@ class Translator:
         started = time.monotonic()
         error: str | None = None
         result: str | None = None
+        halted = False
         self._request_usage = Usage()
         self._tracking_request = True
         try:
-            result = _summarize_response(await self.project.request_change(text))
+            result = _summarize_response(await self._run_with_retry(lambda: self.project.request_change(text)))
             self._save()
+        except ProviderHTTPError as exc:
+            error = str(exc)
+            halted = True
         except Exception as exc:  # noqa: BLE001 - surface any failure and keep serving
             error = str(exc)
         finally:
@@ -375,6 +417,8 @@ class Translator:
             if error is not None:
                 self.request_status = "error"
                 self.request_error = error
+                if halted:
+                    self._mark_halted(error)
                 print(f"Request failed after {elapsed:.1f}s: {error}", file=sys.stderr)
             else:
                 self.request_status = "done"
@@ -383,17 +427,31 @@ class Translator:
             self.cond.notify_all()
             self._notify()
 
+    def _mark_halted(self, reason: str) -> None:
+        """Stop the worker and cancel the pending queue after a hard (non-200) provider failure.
+
+        Must be called while holding self.cond. Retranslating a chapter clears the halt.
+        """
+        self.halted = True
+        self.halt_reason = reason
+        self.pending.clear()
+        print(f"Halted and cancelled the queue: {reason}", file=sys.stderr)
+
     async def _translate(self, index: int) -> None:
         title, content = self.sources[index]
         started = time.monotonic()
         error: str | None = None
+        halted = False
         chapter: Chapter | None = None
         self.stream_text[index] = ""
         self.usage[index] = Usage()
         self._streaming = index
         try:
-            chapter = await self.project.translate_new_chapter(title, content)
+            chapter = await self._run_with_retry(lambda: self.project.translate_new_chapter(title, content))
             self._save()
+        except ProviderHTTPError as exc:
+            error = str(exc)
+            halted = True
         except Exception as exc:  # noqa: BLE001 - surface any failure on the chapter page
             error = str(exc)
         finally:
@@ -404,6 +462,8 @@ class Translator:
             if error is not None:
                 self.status[index] = "error"
                 self.errors[index] = error
+                if halted:
+                    self._mark_halted(error)
                 print(f"Failed chapter {index + 1} ({title}) after {elapsed:.1f}s{_usage_suffix(usage)}: {error}", file=sys.stderr)
             else:
                 assert chapter is not None
@@ -421,8 +481,10 @@ class Translator:
         self.save_path.write_text(self.project.dumps(indent=4, separators=(", ", ": ")), encoding="utf-8")
 
     async def retranslate(self, index: int) -> None:
-        """Drop an existing translation and queue the chapter to translate again."""
+        """Drop an existing translation and queue the chapter to translate again, clearing any halt."""
         async with self.cond:
+            self.halted = False
+            self.halt_reason = None
             chapter = self.translated.pop(index, None)
             if chapter is not None and chapter in self.project.chapters:
                 self.project.chapters.remove(chapter)
