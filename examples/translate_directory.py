@@ -162,10 +162,15 @@ def _page(title: str, body: str, *, script: str = "") -> bytes:
 
 
 def _usage_suffix(usage: Usage) -> str:
-    """Render a token-usage tag (input and output, summed over every pass), or '' when none."""
+    """Render a token-usage tag (input and output, summed over every pass), or '' when none.
+
+    Input is the total summed over all passes; the cached part (cheap prompt-cache re-reads, e.g.
+    a large glossary read again each pass) is called out so the fresh cost is clear.
+    """
     if not usage:
         return ""
-    return f" ({usage.input_tokens:,} in / {usage.output_tokens:,} out tokens)"
+    cached = f", {usage.cached_tokens:,} cached" if usage.cached_tokens else ""
+    return f" ({usage.input_tokens:,} in{cached} / {usage.output_tokens:,} out tokens)"
 
 
 def _summarize_response(response: TranslationResponse) -> str:
@@ -703,7 +708,29 @@ def main() -> int:
 
 
 async def _start(translator: Translator) -> None:
+    _silence_connection_reset()
     translator.start()
+
+
+def _silence_connection_reset() -> None:
+    """Ignore the harmless ConnectionResetError the Windows proactor loop logs when a client drops.
+
+    aiohttp handles the dropped connection fine; the traceback comes from the transport's own
+    close callback, so it only reaches the loop's exception handler. Everything else is passed
+    through to the previous handler unchanged.
+    """
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+
+    def handler(loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        if isinstance(context.get("exception"), ConnectionResetError):
+            return
+        if previous is not None:
+            previous(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    loop.set_exception_handler(handler)
 
 
 if __name__ == "__main__":

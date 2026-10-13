@@ -394,6 +394,17 @@ def test_full_schema_is_sent_to_the_model() -> None:
     )
 
 
+def test_review_and_linking_embed_the_chapter() -> None:
+    cleanup = ChapterCleanup(title="Ch1", content=Content(nodes=[TextNode(text="cleaned text")]))
+    provider = FakeProvider([_analysis(), _draft(text="draft text"), json.dumps(cleanup.to_dict()), _draft()])
+    wn = WebNovel("src", "", provider=provider)
+    wn.translate_new_chapter("t", "c")
+    convo = provider.last_messages  # the pass-4 (linking) conversation
+    assert any(m.role == "user" and "draft text" in m.content for m in convo)  # cleanup pass got the draft to review
+    assert any(m.role == "user" and "cleaned text" in m.content for m in convo)  # linking pass got the cleaned chapter
+    assert any(m.role == "user" and "in full" in m.content.lower() for m in convo)
+
+
 def test_cleanup_pass_can_fix_glossary_and_context() -> None:
     cleanup = ChapterCleanup(
         title="Ch1",

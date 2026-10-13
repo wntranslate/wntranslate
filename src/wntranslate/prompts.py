@@ -89,6 +89,12 @@ _NOTES_RULE = (
     "once it no longer holds, and return the full updated list whenever you change notes (otherwise leave unset)."
 )
 
+_COMPLETENESS = (
+    "Fill every required field. ALWAYS translate the chapter's title into the target language and return it in the "
+    "title field — never leave the title in the source language, blank, missing, or just copied from the source. The "
+    "content must hold the whole chapter from first line to last."
+)
+
 
 def _content_nodes(settings: TranslationSettings) -> str:
     text = (
@@ -286,6 +292,7 @@ def generate_analysis_prompt(settings: TranslationSettings) -> str:
 
 def _translation_rules(settings: TranslationSettings) -> list[str]:
     rules = [
+        _COMPLETENESS,
         _content_nodes(settings),
         f"{_REPHRASING[settings.creativity]} Always preserve the original meaning, tone, and characterization.",
         _ONOMATOPOEIA,
@@ -371,8 +378,9 @@ def generate_linking_prompt(settings: TranslationSettings) -> str:
         (
             "Pass 4 of 4 — glossary linking. Re-read the translated content and return the same chapter with its "
             "glossary names linked. Change ONLY how names are represented — keep all wording, punctuation, line "
-            "breaks, and every other node exactly as they were."
+            "breaks, the title, and every other node exactly as they were."
         ),
+        _COMPLETENESS,
         _content_nodes(settings),
         (
             "Wherever a name that HAS a glossary entry appears as plain text, replace just that text with a term node "

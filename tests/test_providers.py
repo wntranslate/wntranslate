@@ -229,6 +229,17 @@ def test_usage_reported(monkeypatch: pytest.MonkeyPatch) -> None:
     assert seen == [Usage(120, 34)]
 
 
+def test_usage_reports_cached_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_urlopen(request: urllib.request.Request, timeout: float | None = None) -> _FakeResponse:
+        usage = {"prompt_tokens": 1000, "completion_tokens": 50, "prompt_tokens_details": {"cached_tokens": 900}}
+        return _FakeResponse(json.dumps({"choices": [{"message": {"content": "ok"}}], "usage": usage}).encode("utf-8"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    seen: list[Usage] = []
+    OpenAIProvider(model="m", on_usage=seen.append).complete([Message(role="user", content="hi")])
+    assert seen == [Usage(1000, 50, cached_tokens=900)]
+
+
 def test_usage_absent_no_callback(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_urlopen(request: urllib.request.Request, timeout: float | None = None) -> _FakeResponse:
         return _FakeResponse(json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8"))

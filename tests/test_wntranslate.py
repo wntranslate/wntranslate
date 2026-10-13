@@ -27,12 +27,16 @@ from wntranslate import (
     TranslationResponse,
     TranslationSettings,
     WebNovel,
+    generate_linking_prompt,
     generate_prompt,
+    generate_translation_prompt,
+    metadata_schema,
     output_schema,
     parse_model_output,
     request_schema,
     response_schema,
 )
+from wntranslate.webnovel import _flatten
 
 
 def test_version() -> None:
@@ -86,6 +90,8 @@ def test_prompt_override() -> None:
 def test_generate_prompt_varies() -> None:
     assert "footnotes only" in generate_prompt(TranslationSettings())
     assert "runaway" in generate_prompt(TranslationSettings())
+    assert "translate the chapter's title" in generate_translation_prompt(TranslationSettings()).lower()
+    assert "translate the chapter's title" in generate_linking_prompt(TranslationSettings()).lower()
     assert "Do not produce footnotes" in generate_prompt(TranslationSettings(create_footnotes=False))
     assert "Do not produce chapter summaries" in generate_prompt(
         TranslationSettings(generate_chapter_summaries=False)
@@ -255,6 +261,20 @@ def test_request_schema() -> None:
 def test_output_schema() -> None:
     schema = output_schema(TranslationSettings())
     assert len(schema["oneOf"]) == 2
+
+
+def test_flatten_wire_schema() -> None:
+    flat = _flatten(output_schema(TranslationSettings()))
+    assert "oneOf" not in flat
+    assert flat["type"] == "object"
+    assert flat["required"] == ["response_type"]
+    assert set(flat["properties"]["response_type"]["enum"]) == {
+        ResponseType.REQUEST.value,
+        ResponseType.TRANSLATION.value,
+    }
+    assert "requests" in flat["properties"]
+    assert "chapters" in flat["properties"]
+    assert _flatten(metadata_schema()) == metadata_schema()
 
 
 def test_request_round_trip() -> None:

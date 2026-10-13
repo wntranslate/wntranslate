@@ -24,15 +24,22 @@ class Usage:
     """Token usage reported by a provider for one completion.
 
     Args:
-        input_tokens: Prompt (input) tokens consumed.
+        input_tokens: Prompt (input) tokens consumed, including any served from cache.
         output_tokens: Generated (output) tokens.
+        cached_tokens: The part of input_tokens served from (or written to) a prompt cache; these
+            are billed at a steep discount, so a large value here is cheap re-reading, not new cost.
     """
 
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_tokens: int = 0
 
     def __add__(self, other: Usage) -> Usage:
-        return Usage(self.input_tokens + other.input_tokens, self.output_tokens + other.output_tokens)
+        return Usage(
+            self.input_tokens + other.input_tokens,
+            self.output_tokens + other.output_tokens,
+            self.cached_tokens + other.cached_tokens,
+        )
 
     def __bool__(self) -> bool:
         return bool(self.input_tokens or self.output_tokens)

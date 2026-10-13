@@ -93,10 +93,11 @@ def test_anthropic_forces_tool_for_schema(monkeypatch: pytest.MonkeyPatch) -> No
     ]
 
 
-def test_force_tool_wraps_root_oneof() -> None:
+def test_force_tool_uses_schema_as_input() -> None:
     body: dict[str, Any] = {}
-    _force_tool(body, "wn", {"oneOf": [{"type": "object"}, {"type": "object"}]})
-    assert body["tools"][0]["input_schema"] == {"type": "object", "oneOf": [{"type": "object"}, {"type": "object"}]}
+    _force_tool(body, "wn", _SCHEMA)
+    assert body["tools"][0]["input_schema"] == _SCHEMA
+    assert body["tools"][0]["cache_control"] == {"type": "ephemeral"}
     assert body["tool_choice"] == {"type": "tool", "name": "wn"}
 
 
@@ -143,11 +144,23 @@ def test_anthropic_usage_reported(monkeypatch: pytest.MonkeyPatch) -> None:
     assert seen == [Usage(200, 45)]
 
 
+def test_anthropic_usage_includes_cache_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_urlopen(request: urllib.request.Request, timeout: float | None = None) -> _FakeResponse:
+        usage = {"input_tokens": 84, "cache_creation_input_tokens": 12000, "cache_read_input_tokens": 3000, "output_tokens": 5167}
+        payload = {"content": [{"type": "text", "text": "ok"}], "usage": usage}
+        return _FakeResponse(json.dumps(payload).encode("utf-8"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    seen: list[Usage] = []
+    AnthropicProvider(model="claude-x", on_usage=seen.append).complete([Message(role="user", content="hi")])
+    assert seen == [Usage(84 + 12000 + 3000, 5167, cached_tokens=12000 + 3000)]
+
+
 def test_anthropic_stream_accumulates_usage(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_urlopen(request: urllib.request.Request, timeout: float | None = None) -> _FakeStream:
         return _FakeStream(
             [
-                'data: {"type": "message_start", "message": {"usage": {"input_tokens": 60, "output_tokens": 1}}}',
+                'data: {"type": "message_start", "message": {"usage": {"input_tokens": 60, "cache_read_input_tokens": 500, "output_tokens": 1}}}',
                 'data: {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "hel"}}',
                 'data: {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "lo"}}',
                 'data: {"type": "message_delta", "usage": {"output_tokens": 48}}',
@@ -159,7 +172,7 @@ def test_anthropic_stream_accumulates_usage(monkeypatch: pytest.MonkeyPatch) -> 
     seen: list[Usage] = []
     out = AnthropicProvider(model="claude-x", stream=True, on_usage=seen.append).complete([Message(role="user", content="hi")])
     assert out == "hello"
-    assert seen == [Usage(60, 48)]
+    assert seen == [Usage(560, 48, cached_tokens=500)]
 
 
 def test_build_body_collapses_system_and_merges_roles() -> None:

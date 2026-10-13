@@ -65,11 +65,39 @@ def _cap_runs(text: str, limit: int) -> str:
     return re.sub(rf"([^\n])\1{{{limit},}}", lambda match: match.group(1) * limit, text)
 
 
+def _flatten(schema: dict[str, Any]) -> dict[str, Any]:
+    """Collapse a top-level request/result oneOf into one flat object keyed by response_type.
+
+    A top-level oneOf is both rejected by Anthropic tool schemas and unreliable for models to
+    fill (they omit the response_type discriminator buried in the branches). This is sent to the
+    model for every provider; the library still validates the reply against the original oneOf, so
+    per-branch required fields are enforced and errors stay precise. Non-oneOf schemas (e.g. the
+    metadata object) are returned unchanged.
+    """
+    branches = schema.get("oneOf")
+    if not isinstance(branches, list):
+        return schema
+    properties: dict[str, Any] = {}
+    response_types: list[Any] = []
+    for branch in branches:
+        if not isinstance(branch, dict):
+            continue
+        properties.update(branch.get("properties", {}))
+        response_types.extend(branch.get("properties", {}).get("response_type", {}).get("enum", []))
+    properties["response_type"] = {"type": "string", "enum": response_types}
+    return {
+        "type": "object",
+        "required": ["response_type"],
+        "additionalProperties": False,
+        "properties": properties,
+    }
+
+
 def _schema_message(schema: dict[str, Any]) -> Message:
     return Message(
         role="system",
         content="Return exactly one JSON object that conforms to this JSON Schema:\n"
-        + json.dumps(schema, ensure_ascii=False),
+        + json.dumps(_flatten(schema), ensure_ascii=False),
     )
 
 
@@ -399,14 +427,29 @@ class _BaseWebNovel:
     def _analysis_user(self, original_title: str, original_content: str) -> str:
         return f"Analyze this new chapter.\n\nTitle:\n{self._cap(original_title)}\n\nContent:\n{self._cap(original_content)}"
 
-    def _draft_user(self) -> str:
-        return "Now translate this chapter, using the finalized glossary in the updated project state above."
+    def _draft_user(self, original_content: str) -> str:
+        return (
+            "Now translate this chapter IN FULL, using the finalized glossary in the updated project state above. "
+            "Translate every paragraph from the first line to the last — never stop early, summarize, or omit any "
+            f"part of it.\n\nContent:\n{self._cap(original_content)}"
+        )
 
-    def _cleanup_user(self) -> str:
-        return "Review the translation you just produced and return the corrected chapter."
+    def _chapter_json(self, title: str, content: Content) -> str:
+        return json.dumps({"title": title, "content": content.to_dict()}, ensure_ascii=False)
 
-    def _linking_user(self) -> str:
-        return "Now link the glossary names in the chapter you just produced, changing nothing else."
+    def _cleanup_user(self, draft: ChapterDraft) -> str:
+        return (
+            "Review this translation and return the ENTIRE corrected chapter — every node from start to finish, not "
+            "only the parts you change. Here is the chapter you produced:\n\n"
+            + self._chapter_json(draft.title, draft.content)
+        )
+
+    def _linking_user(self, cleanup: ChapterCleanup) -> str:
+        return (
+            "Link the glossary names in this chapter and return it IN FULL — every node from start to finish, "
+            "changing nothing else. Here is the chapter:\n\n"
+            + self._chapter_json(cleanup.title, cleanup.content)
+        )
 
     def _apply_glossary_and_context(self, glossary_updates: list[GlossaryUpdate], context: ContextUpdate | None) -> None:
         for update in glossary_updates:
@@ -685,13 +728,13 @@ class WebNovel(_BaseWebNovel):
             )
             conversation.append(Message(role="system", content=generate_translation_prompt(self.settings)))
             conversation.append(_schema_message(draft_schema))
-            conversation.append(Message(role="user", content=self._draft_user()))
-            self._ask(conversation, draft_schema, parse_draft)  # the draft stays in the conversation for pass 3 to review
+            conversation.append(Message(role="user", content=self._draft_user(original_content)))
+            draft = self._ask(conversation, draft_schema, parse_draft)
 
             cleanup_schema = cleanup_output_schema(self.settings)
             conversation.append(Message(role="system", content=generate_cleanup_prompt(self.settings)))
             conversation.append(_schema_message(cleanup_schema))
-            conversation.append(Message(role="user", content=self._cleanup_user()))
+            conversation.append(Message(role="user", content=self._cleanup_user(draft)))
             cleanup = self._ask(conversation, cleanup_schema, parse_cleanup)
             self._apply_cleanup(cleanup)
 
@@ -700,7 +743,7 @@ class WebNovel(_BaseWebNovel):
             )
             conversation.append(Message(role="system", content=generate_linking_prompt(self.settings)))
             conversation.append(_schema_message(draft_schema))
-            conversation.append(Message(role="user", content=self._linking_user()))
+            conversation.append(Message(role="user", content=self._linking_user(cleanup)))
             linked = self._ask(conversation, draft_schema, parse_draft)
 
             chapter = self._apply_draft(linked, original_title, original_content, analysis)
@@ -715,7 +758,7 @@ class WebNovel(_BaseWebNovel):
     ) -> _T:
         if self.provider is None:
             raise TranslationError("no provider configured")
-        fmt = json_schema_format("wntranslate", schema)
+        fmt = json_schema_format("wntranslate", _flatten(schema))
         rounds = _MAX_REQUEST_ROUNDS
         schema_retries = _MAX_SCHEMA_RETRIES
         while True:
@@ -880,13 +923,13 @@ class AsyncWebNovel(_BaseWebNovel):
             )
             conversation.append(Message(role="system", content=generate_translation_prompt(self.settings)))
             conversation.append(_schema_message(draft_schema))
-            conversation.append(Message(role="user", content=self._draft_user()))
-            await self._ask(conversation, draft_schema, parse_draft)  # the draft stays in the conversation for pass 3
+            conversation.append(Message(role="user", content=self._draft_user(original_content)))
+            draft = await self._ask(conversation, draft_schema, parse_draft)
 
             cleanup_schema = cleanup_output_schema(self.settings)
             conversation.append(Message(role="system", content=generate_cleanup_prompt(self.settings)))
             conversation.append(_schema_message(cleanup_schema))
-            conversation.append(Message(role="user", content=self._cleanup_user()))
+            conversation.append(Message(role="user", content=self._cleanup_user(draft)))
             cleanup = await self._ask(conversation, cleanup_schema, parse_cleanup)
             self._apply_cleanup(cleanup)
 
@@ -895,7 +938,7 @@ class AsyncWebNovel(_BaseWebNovel):
             )
             conversation.append(Message(role="system", content=generate_linking_prompt(self.settings)))
             conversation.append(_schema_message(draft_schema))
-            conversation.append(Message(role="user", content=self._linking_user()))
+            conversation.append(Message(role="user", content=self._linking_user(cleanup)))
             linked = await self._ask(conversation, draft_schema, parse_draft)
 
             chapter = self._apply_draft(linked, original_title, original_content, analysis)
@@ -910,7 +953,7 @@ class AsyncWebNovel(_BaseWebNovel):
     ) -> _T:
         if self.provider is None:
             raise TranslationError("no provider configured")
-        fmt = json_schema_format("wntranslate", schema)
+        fmt = json_schema_format("wntranslate", _flatten(schema))
         rounds = _MAX_REQUEST_ROUNDS
         schema_retries = _MAX_SCHEMA_RETRIES
         while True:

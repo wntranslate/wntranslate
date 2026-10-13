@@ -180,17 +180,17 @@ def _tool_name(response_format: dict[str, Any]) -> str:
 
 
 def _force_tool(body: dict[str, Any], name: str, schema: dict[str, Any]) -> None:
-    """Add a single tool with the schema as input_schema and force the model to call it.
+    """Add a single tool with the schema as its input_schema and force the model to call it.
 
-    This is Anthropic's way to enforce a JSON schema. A root-level oneOf is wrapped so the
-    input_schema is an object schema, as the API expects; the tool is marked for prompt caching.
+    This is Anthropic's way to enforce a JSON schema. The schema is an object with no top-level
+    oneOf/anyOf/allOf (the library's wire schemas nest those under a property), as the API
+    requires; the tool is marked for prompt caching.
     """
-    input_schema = schema if schema.get("type") == "object" else {"type": "object", **schema}
     body["tools"] = [
         {
             "name": name,
             "description": "Return the result as a single structured object matching the schema.",
-            "input_schema": input_schema,
+            "input_schema": schema,
             "cache_control": _EPHEMERAL,
         }
     ]
@@ -251,12 +251,27 @@ def _delta(data: str) -> tuple[str, str, str]:
     return "", "", ""
 
 
+def _cached_tokens(usage: dict[str, Any]) -> int:
+    """Input tokens written to or read from the prompt cache (billed at a discount)."""
+    return _int(usage.get("cache_creation_input_tokens")) + _int(usage.get("cache_read_input_tokens"))
+
+
+def _input_tokens(usage: dict[str, Any]) -> int:
+    """Total input tokens, including cached ones.
+
+    With prompt caching, input_tokens counts only the uncached input; the cached part is split
+    into cache_creation_input_tokens (written) and cache_read_input_tokens (read). The three are
+    disjoint, so the true input total is their sum.
+    """
+    return _int(usage.get("input_tokens")) + _cached_tokens(usage)
+
+
 def _usage(payload: dict[str, Any]) -> Usage:
     """Read token usage from a Messages response body."""
     usage = payload.get("usage")
     if not isinstance(usage, dict):
         return Usage()
-    return Usage(_int(usage.get("input_tokens")), _int(usage.get("output_tokens")))
+    return Usage(_input_tokens(usage), _int(usage.get("output_tokens")), _cached_tokens(usage))
 
 
 class _StreamUsage:
@@ -269,6 +284,7 @@ class _StreamUsage:
     def __init__(self) -> None:
         self.input_tokens = 0
         self.output_tokens = 0
+        self.cached_tokens = 0
 
     def feed(self, data: str) -> None:
         try:
@@ -281,8 +297,9 @@ class _StreamUsage:
         usage = source.get("usage") if isinstance(source, dict) else None
         if not isinstance(usage, dict):
             return
-        self.input_tokens = _int(usage.get("input_tokens")) or self.input_tokens
+        self.input_tokens = _input_tokens(usage) or self.input_tokens
+        self.cached_tokens = _cached_tokens(usage) or self.cached_tokens
         self.output_tokens = _int(usage.get("output_tokens")) or self.output_tokens
 
     def done(self) -> Usage:
-        return Usage(self.input_tokens, self.output_tokens)
+        return Usage(self.input_tokens, self.output_tokens, self.cached_tokens)

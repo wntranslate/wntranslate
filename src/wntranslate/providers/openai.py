@@ -261,11 +261,17 @@ def _delta(data: str) -> tuple[str, str]:
 
 
 def _usage(payload: dict[str, Any]) -> Usage:
-    """Read token usage from a chat completions response (or streamed chunk)."""
+    """Read token usage from a chat completions response (or streamed chunk).
+
+    prompt_tokens already includes cached tokens; the cached count comes from
+    prompt_tokens_details.cached_tokens (OpenAI) or prompt_cache_hit_tokens (DeepSeek).
+    """
     usage = payload.get("usage")
     if not isinstance(usage, dict):
         return Usage()
-    return Usage(_int(usage.get("prompt_tokens")), _int(usage.get("completion_tokens")))
+    details = usage.get("prompt_tokens_details")
+    cached = _int(details.get("cached_tokens")) if isinstance(details, dict) else _int(usage.get("prompt_cache_hit_tokens"))
+    return Usage(_int(usage.get("prompt_tokens")), _int(usage.get("completion_tokens")), cached)
 
 
 def _stream_usage(data: str) -> Usage | None:
