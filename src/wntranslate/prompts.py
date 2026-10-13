@@ -45,10 +45,11 @@ def _content_nodes(settings: TranslationSettings) -> str:
         '({"type": "text", "text": "..."}, Markdown allowed), including ordinary words, kept loanwords, and the names '
         "of terms not yet in the glossary. "
         'Use a term node ({"type": "term", "term_id": "<id>", "alias_id": null}) only to reference an entry that '
-        "already exists in the provided glossary, by its exact id (plus an alias id when one applies); this keeps that "
-        "name consistent if it is later renamed. term_id must be an id taken verbatim from the provided glossary — "
-        "never a plain word, an id you made up, or an entry you are adding this response. A word is not a term node "
-        "just because it is notable or foreign"
+        "already exists in the provided glossary, by its exact id; this keeps that name consistent if it is later "
+        "renamed. term_id must be an id taken verbatim from the provided glossary — never a plain word, an id you made "
+        "up, or an entry you are adding this response. alias_id is null unless you are using one of THAT SAME entry's "
+        "own aliases (an alias listed under that term_id); it must be an alias id of term_id, never an alias id from a "
+        "different entry. A word is not a term node just because it is notable or foreign"
     )
     if settings.create_footnotes:
         content_nodes += '. A footnote node ({"type": "footnote", "content": "..."}) holds a short translator note'
@@ -360,10 +361,14 @@ def generate_cleanup_prompt(settings: TranslationSettings) -> str:
 
     if settings.allow_glossary_edit or settings.allow_glossary_delete:
         sections.append(
-            "You may also correct mistakes the analysis pass made: if a glossary entry was added wrongly (wrong type, "
-            "blank name, or not actually a name) fix it with a glossary edit or delete, and if the notes or summary "
-            "gained something that does not belong, fix them. Make only corrections here — do NOT add new glossary "
-            "entries, notes, or summary; leave glossary_updates empty and context null when nothing needs fixing."
+            "You MUST also correct mistakes the analysis pass made — this is required, not optional. Check every entry "
+            "and alias it just added against the rest of the glossary: if one duplicates an entry that already existed (the same name, person, or "
+            "thing), delete the newly-added duplicate and move anything it had that the surviving entry lacks (an "
+            "alias, a better definition) onto that surviving entry with an edit — keep the entry that was already "
+            "established. Likewise fix an entry given the wrong type, a blank name, or that is not actually a name, "
+            "and remove anything that does not belong from the notes or summary. Make only corrections here — do NOT "
+            "add brand-new glossary entries, notes, or summary; leave glossary_updates empty and context null when "
+            "nothing needs fixing. The linking pass will then reference whichever entry survives."
         )
 
     sections.append("Return one JSON object matching the schema: either a data request or the corrected chapter, never both.")
@@ -388,9 +393,11 @@ def generate_linking_prompt(settings: TranslationSettings) -> str:
         _content_nodes(settings),
         (
             "Go through the content and, wherever a name that HAS a glossary entry appears as plain text, replace just "
-            "that text with a term node for that entry (use its alias id when the written form matches one of the "
-            "entry's aliases). Leave ordinary words, kept loanwords, and any name without a glossary entry as text. "
-            "term_id and alias_id must be ids copied verbatim from the provided glossary, never invented."
+            "that text with a term node for that entry. Set alias_id only when the written form matches one of THAT "
+            "entry's own aliases, and then it must be an alias id listed under that term_id — never an alias id from a "
+            "different entry (matching the wording is not enough; the alias must belong to the entry you point term_id "
+            "at). Leave ordinary words, kept loanwords, and any name without a glossary entry as text. term_id and "
+            "alias_id must be ids copied verbatim from the provided glossary, never invented."
         ),
         "Return one JSON object matching the schema: either a data request or the linked chapter, never both.",
     ]

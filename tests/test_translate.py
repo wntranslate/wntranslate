@@ -152,6 +152,29 @@ def test_request_change_glossary_edit() -> None:
     assert edited.name == "Ayame"
 
 
+def test_term_node_alias_from_other_entry_is_rejected() -> None:
+    wn = WebNovel("src", "")
+    iroha = PersonEntry(name="Iroha")
+    mai = PersonEntry(name="Mai", aliases=[Alias(original="マイちゃん", translation="Mai-chan")])
+    wn.glossary.add(iroha)
+    wn.glossary.add(mai)
+    bad = TranslationResponse(
+        chapters=[
+            ChapterTranslation(
+                title="Ch",
+                summary="",
+                content=Content(nodes=[TextNode(text="Hi "), TermNode(term_id=iroha.id, alias_id=mai.aliases[0].id)]),
+            )
+        ]
+    )
+    provider = FakeProvider(_dump(bad))
+    wn.provider = provider
+    with pytest.raises(TranslationError, match="response schema invalid"):
+        wn.request_change("x")
+    assert any("not an alias of entry" in m.content for m in provider.last_messages)
+    assert len(wn.chapters) == 0
+
+
 def test_request_change_unknown_target_id_errors() -> None:
     wn = WebNovel("src", "")
     wn.chapters.append(

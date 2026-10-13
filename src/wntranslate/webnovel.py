@@ -8,7 +8,7 @@ import jsonschema
 
 from ._version import __version__
 from .chapter import Chapter
-from .content import TermNode
+from .content import Content, TermNode
 from .context import Context
 from .enums import ContextType, GlossaryOp, RequestKind
 from .glossary import Glossary
@@ -410,6 +410,31 @@ class _BaseWebNovel:
                 raise TranslationError(f"exceeds glossary {action} limit: {limit}")
         self._check_glossary_references(updates)
 
+    def _check_term_refs(self, result: object) -> None:
+        """Validate that every content term node points at a real entry and one of its own aliases.
+
+        Raises:
+            _SchemaError: When a term_id is not a glossary entry, or an alias_id does not belong
+                to that entry — so the caller can ask the model to correct it.
+        """
+        contents: list[Content] = []
+        if isinstance(result, ChapterDraft | ChapterCleanup):
+            contents.append(result.content)
+        elif isinstance(result, TranslationResponse):
+            contents.extend(payload.content for payload in result.chapters)
+        for content in contents:
+            for node in content.nodes:
+                if not isinstance(node, TermNode):
+                    continue
+                entry = self.glossary.get(node.term_id)
+                if entry is None:
+                    raise _SchemaError(f"term node term_id {node.term_id!r} is not an id in the glossary")
+                if node.alias_id is not None and entry.get_alias(node.alias_id) is None:
+                    raise _SchemaError(
+                        f"term node alias_id {node.alias_id!r} is not an alias of entry {node.term_id!r} "
+                        f"({entry.name!r}); an alias_id must be one of that same entry's own aliases"
+                    )
+
     def _referenced_ids(self) -> tuple[set[str], set[str]]:
         """Collect glossary entry ids and alias ids referenced by any chapter's content.
 
@@ -620,14 +645,15 @@ class WebNovel(_BaseWebNovel):
             raw = self.provider.complete(conversation, response_format=fmt)
             conversation.append(Message(role="assistant", content=raw))
             try:
-                data = self._validate(raw, schema)
+                result = parse(self._validate(raw, schema))
+                if not isinstance(result, TranslationRequest):
+                    self._check_term_refs(result)
             except _SchemaError as error:
                 if schema_retries <= 0:
                     raise TranslationError("response schema invalid") from error
                 schema_retries -= 1
                 conversation.append(Message(role="system", content=_schema_correction(error.detail)))
                 continue
-            result = parse(data)
             if isinstance(result, TranslationRequest):
                 rounds -= 1
                 if rounds <= 0:
@@ -814,14 +840,15 @@ class AsyncWebNovel(_BaseWebNovel):
             raw = await self.provider.complete(conversation, response_format=fmt)
             conversation.append(Message(role="assistant", content=raw))
             try:
-                data = self._validate(raw, schema)
+                result = parse(self._validate(raw, schema))
+                if not isinstance(result, TranslationRequest):
+                    self._check_term_refs(result)
             except _SchemaError as error:
                 if schema_retries <= 0:
                     raise TranslationError("response schema invalid") from error
                 schema_retries -= 1
                 conversation.append(Message(role="system", content=_schema_correction(error.detail)))
                 continue
-            result = parse(data)
             if isinstance(result, TranslationRequest):
                 rounds -= 1
                 if rounds <= 0:
