@@ -13,6 +13,7 @@ from .openai import (
     ReasoningEffort,
     _build_body,
     _delta,
+    _sampling_params,
     _stream_usage,
     _usage,
 )
@@ -31,6 +32,9 @@ class AsyncOpenAIProvider(AsyncProvider):
         supports_schema: Whether the API supports a json_schema response_format;
             when False, the schema is added to the prompt and JSON mode is used.
         reasoning_effort: Reasoning effort to request, or None to omit the field.
+        frequency_penalty: OpenAI frequency_penalty, or None to omit it; a small positive value
+            (e.g. 0.3) curbs runaway repetition where a weak model degenerates into an endless run.
+        presence_penalty: OpenAI presence_penalty, or None to omit it.
         headers: Extra headers to send.
         stream: Whether to stream the response (and call on_token per piece).
         on_token: Callback invoked with each streamed text piece.
@@ -41,9 +45,11 @@ class AsyncOpenAIProvider(AsyncProvider):
     api_key: str | None = None
     base_url: str = "https://api.openai.com/v1"
     timeout: float | None = 1200.0
-    temperature: float | None = 0.3
+    temperature: float | None = 0.4
     supports_schema: bool = True
     reasoning_effort: ReasoningEffort | None = ReasoningEffort.NONE
+    frequency_penalty: float | None = 0.3
+    presence_penalty: float | None = None
     headers: dict[str, str] = field(default_factory=dict)
     stream: bool = False
     on_token: Callable[[str], None] | None = None
@@ -135,9 +141,10 @@ class AsyncOpenAIProvider(AsyncProvider):
         response_format: dict[str, Any] | None,
         extra_body: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        return _build_body(
-            self.model, messages, response_format, self.temperature, self.supports_schema, self.reasoning_effort, extra_body
-        )
+        return _build_body(self.model, messages, response_format, self.supports_schema, self._sampling(), extra_body)
+
+    def _sampling(self) -> dict[str, Any]:
+        return _sampling_params(self.temperature, self.reasoning_effort, self.frequency_penalty, self.presence_penalty)
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json", **self.headers}

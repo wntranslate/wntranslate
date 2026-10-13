@@ -41,7 +41,7 @@ class AsyncAnthropicProvider(AsyncProvider):
     api_key: str | None = None
     base_url: str = "https://api.anthropic.com/v1"
     timeout: float | None = 1200.0
-    temperature: float | None = 0.3
+    temperature: float | None = 0.4
     max_tokens: int = 8192
     anthropic_version: str = _ANTHROPIC_VERSION
     headers: dict[str, str] = field(default_factory=dict)

@@ -48,6 +48,9 @@ class OpenAIProvider(Provider):
         supports_schema: Whether the API supports a json_schema response_format;
             when False, the schema is added to the prompt and JSON mode is used.
         reasoning_effort: Reasoning effort to request, or None to omit the field.
+        frequency_penalty: OpenAI frequency_penalty, or None to omit it; a small positive value
+            (e.g. 0.3) curbs runaway repetition where a weak model degenerates into an endless run.
+        presence_penalty: OpenAI presence_penalty, or None to omit it.
         headers: Extra headers to send.
         stream: Whether to stream the response (and call on_token per piece).
         on_token: Callback invoked with each streamed text piece.
@@ -58,9 +61,11 @@ class OpenAIProvider(Provider):
     api_key: str | None = None
     base_url: str = "https://api.openai.com/v1"
     timeout: float | None = 1200.0
-    temperature: float | None = 0.3
+    temperature: float | None = 0.4
     supports_schema: bool = True
     reasoning_effort: ReasoningEffort | None = ReasoningEffort.NONE
+    frequency_penalty: float | None = 0.3
+    presence_penalty: float | None = None
     headers: dict[str, str] = field(default_factory=dict)
     stream: bool = False
     on_token: Callable[[str], None] | None = None
@@ -83,9 +88,7 @@ class OpenAIProvider(Provider):
         Returns:
             The assistant message content.
         """
-        body = _build_body(
-            self.model, messages, response_format, self.temperature, self.supports_schema, self.reasoning_effort, extra_body
-        )
+        body = _build_body(self.model, messages, response_format, self.supports_schema, self._sampling(), extra_body)
         if self.stream:
             return self._stream(body)
         payload = self._post(body)
@@ -101,6 +104,9 @@ class OpenAIProvider(Provider):
     def _emit(self, usage: Usage) -> None:
         if self.on_usage is not None and usage:
             self.on_usage(usage)
+
+    def _sampling(self) -> dict[str, Any]:
+        return _sampling_params(self.temperature, self.reasoning_effort, self.frequency_penalty, self.presence_penalty)
 
     def _request(self, body: dict[str, Any]) -> urllib.request.Request:
         headers = {"Content-Type": "application/json", **self.headers}
@@ -171,13 +177,31 @@ def _schema_of(response_format: dict[str, Any]) -> dict[str, Any] | None:
     return schema if isinstance(schema, dict) else None
 
 
+def _sampling_params(
+    temperature: float | None,
+    reasoning_effort: ReasoningEffort | None,
+    frequency_penalty: float | None,
+    presence_penalty: float | None,
+) -> dict[str, Any]:
+    """Collect the sampling fields to send, omitting any left as None."""
+    params: dict[str, Any] = {}
+    if temperature is not None:
+        params["temperature"] = temperature
+    if reasoning_effort is not None:
+        params["reasoning_effort"] = reasoning_effort.value
+    if frequency_penalty is not None:
+        params["frequency_penalty"] = frequency_penalty
+    if presence_penalty is not None:
+        params["presence_penalty"] = presence_penalty
+    return params
+
+
 def _build_body(
     model: str,
     messages: Sequence[Message],
     response_format: dict[str, Any] | None,
-    temperature: float | None,
     supports_schema: bool,
-    reasoning_effort: ReasoningEffort | None,
+    sampling: dict[str, Any],
     extra_body: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Build the chat completion request body.
@@ -192,10 +216,7 @@ def _build_body(
             body["response_format"] = {"type": "json_object"}
         else:
             body["response_format"] = response_format
-    if temperature is not None:
-        body["temperature"] = temperature
-    if reasoning_effort is not None:
-        body["reasoning_effort"] = reasoning_effort.value
+    body.update(sampling)
     if extra_body:
         body.update(extra_body)
     return body

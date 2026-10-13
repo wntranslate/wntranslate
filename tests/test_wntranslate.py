@@ -85,6 +85,7 @@ def test_prompt_override() -> None:
 
 def test_generate_prompt_varies() -> None:
     assert "footnotes only" in generate_prompt(TranslationSettings())
+    assert "runaway" in generate_prompt(TranslationSettings())
     assert "Do not produce footnotes" in generate_prompt(TranslationSettings(create_footnotes=False))
     assert "Do not produce chapter summaries" in generate_prompt(
         TranslationSettings(generate_chapter_summaries=False)

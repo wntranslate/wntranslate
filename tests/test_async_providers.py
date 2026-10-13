@@ -62,7 +62,8 @@ def test_async_complete(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured["url"] == "https://api.example/v1/chat/completions"
     assert captured["headers"]["Authorization"] == "Bearer secret"
     assert captured["json"]["model"] == "gpt-x"
-    assert captured["json"]["temperature"] == 0.3
+    assert captured["json"]["temperature"] == 0.4
+    assert captured["json"]["frequency_penalty"] == 0.3
     assert captured["json"]["response_format"] == {"type": "json_object"}
 
 

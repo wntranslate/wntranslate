@@ -72,7 +72,7 @@ def test_builds_request(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured["body"]["model"] == "gpt-x"
     assert captured["body"]["messages"][0] == {"role": "system", "content": "sys"}
     assert captured["body"]["response_format"] == {"type": "json_object"}
-    assert captured["body"]["temperature"] == 0.3
+    assert captured["body"]["temperature"] == 0.4
 
 
 def test_deepseek_preset() -> None:
@@ -152,6 +152,23 @@ def test_custom_temperature(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     OpenAIProvider(model="m", temperature=None).complete([Message(role="user", content="hi")])
     assert "temperature" not in captured["body"]
+
+
+def test_frequency_penalty_default_and_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(request: urllib.request.Request, timeout: float | None = None) -> _FakeResponse:
+        captured["body"] = json.loads(request.data.decode("utf-8")) if request.data else None
+        return _FakeResponse(json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    OpenAIProvider(model="m").complete([Message(role="user", content="hi")])
+    assert captured["body"]["frequency_penalty"] == 0.3
+    assert "presence_penalty" not in captured["body"]
+
+    OpenAIProvider(model="m", frequency_penalty=None, presence_penalty=0.5).complete([Message(role="user", content="hi")])
+    assert "frequency_penalty" not in captured["body"]
+    assert captured["body"]["presence_penalty"] == 0.5
 
 
 def test_no_api_key_omits_authorization(monkeypatch: pytest.MonkeyPatch) -> None:

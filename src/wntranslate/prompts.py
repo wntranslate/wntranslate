@@ -41,7 +41,10 @@ _PUNCTUATION = (
 
 _ONOMATOPOEIA = (
     f"{_LOANWORDS} Keep literal onomatopoeia close to the original (e.g. 'fufufu'), but translate ones with a clear "
-    "meaning or that are not literal (e.g. 'jii-' as a stare, italicized)."
+    "meaning or that are not literal (e.g. 'jii-' as a stare, italicized). When the source stretches a sound by "
+    "repeating one character (a long-vowel mark like 'ー', or a repeated letter), render it as an elongation of "
+    "bounded length (a scream or stretched vowel, not thousands of letters) and then move on; never emit an extreme "
+    "or runaway run of a single character."
 )
 
 _DATA_REQUEST = (
