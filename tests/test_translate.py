@@ -37,6 +37,7 @@ from wntranslate import (
     WebNovel,
     response_schema,
 )
+from wntranslate.webnovel import _cap_runs
 
 
 class FakeProvider(Provider):
@@ -353,6 +354,24 @@ def test_schema_fail_resends_full_schema() -> None:
     assert provider.calls == 2
     assert sum("JSON Schema" in m.content for m in provider.last_messages) >= 2
     assert any("was rejected" in m.content for m in provider.last_messages)
+
+
+def test_cap_runs() -> None:
+    assert _cap_runs("a" + "ー" * 90 + "b", 24) == "a" + "ー" * 24 + "b"
+    assert _cap_runs("hi", 24) == "hi"
+    assert _cap_runs("ー" * 90, 0) == "ー" * 90
+    assert _cap_runs("x\n\n\n\n\ny", 2) == "x\n\n\n\n\ny"
+
+
+def test_long_run_capped_in_prompt_but_source_stored_intact() -> None:
+    scream = "キャ" + "ー" * 90
+    provider = FakeProvider([_analysis(), _draft()])
+    wn = WebNovel("src", "", settings=TranslationSettings(max_source_char_run=24), provider=provider)
+    chapter = wn.translate_new_chapter("t", scream)
+    assert chapter.original_content == scream
+    analysis_msg = next(m for m in provider.last_messages if m.role == "user" and "キャ" in m.content)
+    assert "ー" * 24 in analysis_msg.content
+    assert "ー" * 25 not in analysis_msg.content
 
 
 def test_overview_recent_chapters_include_original_title() -> None:

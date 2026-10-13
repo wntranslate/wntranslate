@@ -26,6 +26,10 @@ class TranslationSettings:
         context_type: Strategy used to maintain the running context.
         creativity: How freely the translation may rephrase the source.
         additional_context: Any extra context for the model (the work, file format, anything), or None.
+        max_source_char_run: Longest run of a single repeated character kept in source text sent to
+            the model; longer runs (e.g. a 90-character scream of 'ー') are shortened to this length
+            in the model-facing copy only, so a weak model is not primed into an endless repeat. The
+            stored source is never changed. Set to 0 to disable.
         prompt: Override for the generated prompt; editing is not recommended.
     """
 
@@ -43,6 +47,7 @@ class TranslationSettings:
     context_type: ContextType = ContextType.ROLLING_SUMMARY
     creativity: Creativity = Creativity.LOW
     additional_context: str | None = None
+    max_source_char_run: int = 24
     prompt: str | None = None
 
     def build_prompt(self) -> str:
@@ -74,6 +79,7 @@ class TranslationSettings:
             "context_type": int(self.context_type),
             "creativity": int(self.creativity),
             "additional_context": self.additional_context,
+            "max_source_char_run": self.max_source_char_run,
             "prompt": self.prompt,
         }
 
@@ -102,5 +108,6 @@ class TranslationSettings:
             context_type=ContextType(data.get("context_type", ContextType.ROLLING_SUMMARY)),
             creativity=Creativity(data.get("creativity", Creativity.LOW)),
             additional_context=data.get("additional_context"),
+            max_source_char_run=data.get("max_source_char_run", 24),
             prompt=data.get("prompt"),
         )

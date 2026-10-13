@@ -9,7 +9,9 @@ import aiohttp
 
 from .base import AsyncProvider, Message, Usage
 from .openai import (
+    ProviderConnectionError,
     ProviderError,
+    ProviderHTTPError,
     ReasoningEffort,
     _build_body,
     _delta,
@@ -84,10 +86,10 @@ class AsyncOpenAIProvider(AsyncProvider):
             ):
                 body = await response.read()
                 if response.status != 200:
-                    raise ProviderError(f"{response.status}: {body.decode('utf-8', 'replace')}")
+                    raise ProviderHTTPError(response.status, body.decode("utf-8", "replace"))
                 decoded = json.loads(body)
-        except aiohttp.ClientError as error:
-            raise ProviderError(str(error)) from error
+        except (aiohttp.ClientError, TimeoutError) as error:
+            raise ProviderConnectionError(str(error)) from error
         if not isinstance(decoded, dict):
             raise ProviderError(f"expected a JSON object, got {type(decoded).__name__}")
         try:
@@ -114,7 +116,7 @@ class AsyncOpenAIProvider(AsyncProvider):
             ):
                 if response.status != 200:
                     body = await response.read()
-                    raise ProviderError(f"{response.status}: {body.decode('utf-8', 'replace')}")
+                    raise ProviderHTTPError(response.status, body.decode("utf-8", "replace"))
                 async for raw_line in response.content:
                     line = raw_line.decode("utf-8").strip()
                     if not line.startswith("data:"):
@@ -130,8 +132,8 @@ class AsyncOpenAIProvider(AsyncProvider):
                         if self.on_token is not None:
                             self.on_token(content)
                     usage = _stream_usage(data) or usage
-        except aiohttp.ClientError as error:
-            raise ProviderError(str(error)) from error
+        except (aiohttp.ClientError, TimeoutError) as error:
+            raise ProviderConnectionError(str(error)) from error
         self._emit(usage)
         return "".join(pieces)
 

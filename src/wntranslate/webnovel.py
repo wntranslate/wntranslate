@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from typing import IO, Any, Self, TypeVar
 
@@ -50,6 +51,18 @@ _MAX_CONTINUATION_ROUNDS = 100
 _OVERVIEW_CHAPTERS = 10
 
 _T = TypeVar("_T")
+
+
+def _cap_runs(text: str, limit: int) -> str:
+    """Shorten any run of a single repeated character longer than limit to limit copies.
+
+    Applied to source text sent to the model so a pathological run (e.g. a 90-character scream of
+    'ー') cannot prime a weak model into an endless repeat. Runs of newlines are left alone, and a
+    limit of 0 or less disables it.
+    """
+    if limit <= 0:
+        return text
+    return re.sub(rf"([^\n])\1{{{limit},}}", lambda match: match.group(1) * limit, text)
 
 
 def _schema_message(schema: dict[str, Any]) -> Message:
@@ -361,7 +374,10 @@ class _BaseWebNovel:
         return messages
 
     def _metadata_messages(self) -> list[Message]:
-        user = f"Translate this webnovel's title and synopsis.\n\nTitle:\n{self.original_title}\n\nSynopsis:\n{self.original_synopsis}"
+        user = (
+            "Translate this webnovel's title and synopsis.\n\n"
+            f"Title:\n{self._cap(self.original_title)}\n\nSynopsis:\n{self._cap(self.original_synopsis)}"
+        )
         return [
             Message(role="system", content=generate_metadata_prompt(self.settings)),
             _schema_message(metadata_schema()),
@@ -377,8 +393,11 @@ class _BaseWebNovel:
             self._state_message(),
         ]
 
+    def _cap(self, text: str) -> str:
+        return _cap_runs(text, self.settings.max_source_char_run)
+
     def _analysis_user(self, original_title: str, original_content: str) -> str:
-        return f"Analyze this new chapter.\n\nTitle:\n{original_title}\n\nContent:\n{original_content}"
+        return f"Analyze this new chapter.\n\nTitle:\n{self._cap(original_title)}\n\nContent:\n{self._cap(original_content)}"
 
     def _draft_user(self) -> str:
         return "Now translate this chapter, using the finalized glossary in the updated project state above."
@@ -562,9 +581,9 @@ class _BaseWebNovel:
         if item.kind is RequestKind.SYNOPSIS:
             return DataResult(request=item, found=True, value=self.synopsis)
         if item.kind is RequestKind.ORIGINAL_TITLE:
-            return DataResult(request=item, found=True, value=self.original_title)
+            return DataResult(request=item, found=True, value=self._cap(self.original_title))
         if item.kind is RequestKind.ORIGINAL_SYNOPSIS:
-            return DataResult(request=item, found=True, value=self.original_synopsis)
+            return DataResult(request=item, found=True, value=self._cap(self.original_synopsis))
         if item.kind is RequestKind.CHAPTER_LIST:
             listed = self.chapters[item.start : item.end]
             overview = [
@@ -579,9 +598,9 @@ class _BaseWebNovel:
         if item.kind is RequestKind.CHAPTER_TEXT:
             return DataResult(request=item, found=found, value=chapter.render(self.glossary) if chapter else None)
         if item.kind is RequestKind.CHAPTER_ORIGINAL_TITLE:
-            return DataResult(request=item, found=found, value=chapter.original_title if chapter else None)
+            return DataResult(request=item, found=found, value=self._cap(chapter.original_title) if chapter else None)
         if item.kind is RequestKind.CHAPTER_ORIGINAL_CONTENT:
-            return DataResult(request=item, found=found, value=chapter.original_content if chapter else None)
+            return DataResult(request=item, found=found, value=self._cap(chapter.original_content) if chapter else None)
         return DataResult(request=item, found=False, value=None)
 
     def __repr__(self) -> str:

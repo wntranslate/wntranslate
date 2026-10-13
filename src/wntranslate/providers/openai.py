@@ -15,6 +15,23 @@ class ProviderError(RuntimeError):
     """Raised when a provider request fails."""
 
 
+class ProviderHTTPError(ProviderError):
+    """Raised when a provider returns a non-200 HTTP status (e.g. auth, quota, bad request).
+
+    Args:
+        status: The HTTP status code.
+        detail: The response body or reason.
+    """
+
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(f"{status}: {detail}")
+        self.status = status
+
+
+class ProviderConnectionError(ProviderError):
+    """Raised when a request never reaches the endpoint (network error, DNS, timeout)."""
+
+
 class ReasoningEffort(Enum):
     """Reasoning effort for an OpenAI-compatible model, sent as the `reasoning_effort` field.
 
@@ -121,9 +138,9 @@ class OpenAIProvider(Provider):
                 decoded = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", "replace")
-            raise ProviderError(f"{error.code} {error.reason}: {detail}") from error
-        except urllib.error.URLError as error:
-            raise ProviderError(str(error.reason)) from error
+            raise ProviderHTTPError(error.code, f"{error.reason}: {detail}") from error
+        except (urllib.error.URLError, TimeoutError) as error:
+            raise ProviderConnectionError(str(getattr(error, "reason", error))) from error
         if not isinstance(decoded, dict):
             raise ProviderError(f"expected a JSON object, got {type(decoded).__name__}")
         return decoded
@@ -144,9 +161,9 @@ class OpenAIProvider(Provider):
                     usage = self._consume(data, pieces) or usage
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", "replace")
-            raise ProviderError(f"{error.code} {error.reason}: {detail}") from error
-        except urllib.error.URLError as error:
-            raise ProviderError(str(error.reason)) from error
+            raise ProviderHTTPError(error.code, f"{error.reason}: {detail}") from error
+        except (urllib.error.URLError, TimeoutError) as error:
+            raise ProviderConnectionError(str(getattr(error, "reason", error))) from error
         self._emit(usage)
         return "".join(pieces)
 

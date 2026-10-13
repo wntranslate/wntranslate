@@ -66,10 +66,12 @@ def test_anthropic_request(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured["body"]["model"] == "claude-x"
     assert captured["body"]["max_tokens"] == 1234
     assert captured["body"]["temperature"] == 0.4
-    assert captured["body"]["system"] == "sys one\n\nsys two"
+    assert captured["body"]["system"] == [
+        {"type": "text", "text": "sys one\n\nsys two", "cache_control": {"type": "ephemeral"}}
+    ]
     assert captured["body"]["messages"] == [
         {"role": "user", "content": "hi"},
-        {"role": "assistant", "content": "{"},
+        {"role": "assistant", "content": [{"type": "text", "text": "{", "cache_control": {"type": "ephemeral"}}]},
     ]
 
 
@@ -144,12 +146,12 @@ def test_build_body_collapses_system_and_merges_roles() -> None:
         Message(role="user", content="u2"),
     ]
     body = _build_body("m", messages, 0.3, 8192, "{", None)
-    assert body["system"] == "base"
+    assert body["system"] == [{"type": "text", "text": "base", "cache_control": {"type": "ephemeral"}}]
     assert body["messages"] == [
         {"role": "user", "content": "u1"},
         {"role": "assistant", "content": "a1"},
         {"role": "user", "content": "data\n\nu2"},
-        {"role": "assistant", "content": "{"},
+        {"role": "assistant", "content": [{"type": "text", "text": "{", "cache_control": {"type": "ephemeral"}}]},
     ]
 
 
@@ -195,7 +197,10 @@ def test_async_anthropic_complete(monkeypatch: pytest.MonkeyPatch) -> None:
     assert out == '{"ok": true}'
     assert captured["url"] == "https://api.anthropic.com/v1/messages"
     assert captured["headers"]["x-api-key"] == "sk"
-    assert captured["json"]["messages"][-1] == {"role": "assistant", "content": "{"}
+    assert captured["json"]["messages"][-1] == {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "{", "cache_control": {"type": "ephemeral"}}],
+    }
 
 
 def test_async_anthropic_http_error(monkeypatch: pytest.MonkeyPatch) -> None:

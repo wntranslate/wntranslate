@@ -8,7 +8,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .base import Message, Provider, Usage, _int
-from .openai import ProviderError
+from .openai import ProviderConnectionError, ProviderError, ProviderHTTPError
+
+_EPHEMERAL = {"type": "ephemeral"}
 
 _ANTHROPIC_VERSION = "2023-06-01"
 
@@ -89,9 +91,9 @@ class AnthropicProvider(Provider):
                 decoded = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", "replace")
-            raise ProviderError(f"{error.code} {error.reason}: {detail}") from error
-        except urllib.error.URLError as error:
-            raise ProviderError(str(error.reason)) from error
+            raise ProviderHTTPError(error.code, f"{error.reason}: {detail}") from error
+        except (urllib.error.URLError, TimeoutError) as error:
+            raise ProviderConnectionError(str(getattr(error, "reason", error))) from error
         if not isinstance(decoded, dict):
             raise ProviderError(f"expected a JSON object, got {type(decoded).__name__}")
         return decoded
@@ -108,9 +110,9 @@ class AnthropicProvider(Provider):
                         self._consume(line[len("data:") :].strip(), pieces, usage)
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", "replace")
-            raise ProviderError(f"{error.code} {error.reason}: {detail}") from error
-        except urllib.error.URLError as error:
-            raise ProviderError(str(error.reason)) from error
+            raise ProviderHTTPError(error.code, f"{error.reason}: {detail}") from error
+        except (urllib.error.URLError, TimeoutError) as error:
+            raise ProviderConnectionError(str(getattr(error, "reason", error))) from error
         self._emit(usage.done())
         return "".join(pieces)
 
@@ -140,7 +142,7 @@ def _build_body(
     and ``prefill`` (when given) is appended as an assistant turn to force its start.
     """
     system_parts: list[str] = []
-    turns: list[dict[str, str]] = []
+    turns: list[dict[str, Any]] = []
     for message in messages:
         if not turns and message.role == "system":
             system_parts.append(message.content)
@@ -155,15 +157,22 @@ def _build_body(
             turns[-1]["content"] += "\n\n" + prefill
         else:
             turns.append({"role": "assistant", "content": prefill})
+    if turns:
+        turns[-1]["content"] = [_cached(turns[-1]["content"])]
     body: dict[str, Any] = {"model": model, "max_tokens": max_tokens, "messages": turns}
     system = "\n\n".join(system_parts)
     if system:
-        body["system"] = system
+        body["system"] = [_cached(system)]
     if temperature is not None:
         body["temperature"] = temperature
     if extra_body:
         body.update(extra_body)
     return body
+
+
+def _cached(text: str) -> dict[str, Any]:
+    """A text content block marked for ephemeral prompt caching, cutting cost across passes."""
+    return {"type": "text", "text": text, "cache_control": _EPHEMERAL}
 
 
 def _text(payload: dict[str, Any]) -> str:
