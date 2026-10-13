@@ -278,7 +278,7 @@ def test_parse_model_output() -> None:
 
 def test_dump_is_versioned() -> None:
     data = json.loads(WebNovel("src", "", title="X").dumps())
-    assert data["version"] == wntranslate.__version__ == "1.0.0"
+    assert data["version"] == wntranslate.__version__
     assert WebNovel.loads(json.dumps(data)).title == "X"
 
 

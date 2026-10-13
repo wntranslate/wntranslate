@@ -38,7 +38,7 @@ class TranslationSettings:
     allow_glossary_delete: bool = True
     glossary_add_limit: int = 100
     glossary_edit_limit: int = 100
-    glossary_delete_limit: int = 5
+    glossary_delete_limit: int = 30
     allow_chapter_reorder: bool = True
     context_type: ContextType = ContextType.ROLLING_SUMMARY
     creativity: Creativity = Creativity.LOW
@@ -97,7 +97,7 @@ class TranslationSettings:
             allow_glossary_delete=data.get("allow_glossary_delete", True),
             glossary_add_limit=data.get("glossary_add_limit", 100),
             glossary_edit_limit=data.get("glossary_edit_limit", 100),
-            glossary_delete_limit=data.get("glossary_delete_limit", 5),
+            glossary_delete_limit=data.get("glossary_delete_limit", 30),
             allow_chapter_reorder=data.get("allow_chapter_reorder", True),
             context_type=ContextType(data.get("context_type", ContextType.ROLLING_SUMMARY)),
             creativity=Creativity(data.get("creativity", Creativity.LOW)),

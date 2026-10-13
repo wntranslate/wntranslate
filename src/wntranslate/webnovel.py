@@ -47,6 +47,7 @@ from .settings import TranslationSettings
 _MAX_REQUEST_ROUNDS = 8
 _MAX_SCHEMA_RETRIES = 3
 _MAX_CONTINUATION_ROUNDS = 100
+_OVERVIEW_CHAPTERS = 10
 
 _T = TypeVar("_T")
 
@@ -82,10 +83,10 @@ def _select_branch(schema: dict[str, Any], data: Any) -> dict[str, Any]:
     return schema
 
 
-def _schema_correction(detail: str) -> str:
+def _correction(detail: str) -> str:
     return (
-        "Your previous response did not match the required JSON Schema and was rejected: "
-        f"{detail}\nReply again with only a JSON object that matches the schema exactly."
+        f"Your previous response was rejected: {detail}\n"
+        "Fix exactly that and reply again with only a JSON object that matches the schema."
     )
 
 
@@ -93,16 +94,25 @@ class TranslationError(RuntimeError):
     """Raised when a model response violates the schema or configured limits."""
 
 
-class _SchemaError(TranslationError):
-    """Internal: a model response failed schema validation and may be retried.
+class _Retryable(TranslationError):
+    """Internal: a rejected model response that the model may be able to fix on a retry.
 
     Args:
-        detail: The validation failure message shown back to the model.
+        detail: What to tell the model so it can correct its next reply.
+        final: The message to raise if retries run out; defaults to detail.
     """
 
-    def __init__(self, detail: str) -> None:
-        super().__init__("response schema invalid")
+    def __init__(self, detail: str, final: str | None = None) -> None:
+        super().__init__(final if final is not None else detail)
         self.detail = detail
+        self.final = final if final is not None else detail
+
+
+class _SchemaError(_Retryable):
+    """A response that failed schema or term validation; retried, else 'response schema invalid'."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail, final="response schema invalid")
 
 
 class _BaseWebNovel:
@@ -304,11 +314,29 @@ class _BaseWebNovel:
             state["summary"] = self.context.summary
         return state
 
+    def _overview(self) -> dict[str, Any]:
+        recent = self.chapters[-_OVERVIEW_CHAPTERS:]
+        return {
+            "original_title": self.original_title,
+            "title": self.title,
+            "original_synopsis": self.original_synopsis,
+            "synopsis": self.synopsis,
+            "total_chapters": len(self.chapters),
+            "recent_chapters": [{"id": c.id, "title": c.title, "kind": c.kind.value} for c in recent],
+        }
+
+    def _overview_message(self) -> Message:
+        return Message(role="system", content="Work overview (JSON):\n" + json.dumps(self._overview(), ensure_ascii=False))
+
+    def _state_message(self) -> Message:
+        return Message(role="system", content="Project state (JSON):\n" + json.dumps(self._state(), ensure_ascii=False))
+
     def _messages(self, user: str, fulfilled: list[dict[str, Any]]) -> list[Message]:
         messages = [
             Message(role="system", content=self.settings.build_prompt()),
             _schema_message(output_schema(self.settings)),
-            Message(role="system", content="Project state (JSON):\n" + json.dumps(self._state(), ensure_ascii=False)),
+            self._overview_message(),
+            self._state_message(),
         ]
         if fulfilled:
             messages.append(
@@ -322,14 +350,16 @@ class _BaseWebNovel:
         return [
             Message(role="system", content=generate_metadata_prompt(self.settings)),
             _schema_message(metadata_schema()),
-            Message(role="system", content="Project state (JSON):\n" + json.dumps(self._state(), ensure_ascii=False)),
+            self._overview_message(),
+            self._state_message(),
             Message(role="user", content=user),
         ]
 
     def _chapter_system(self) -> list[Message]:
         return [
             Message(role="system", content=generate_chapter_prompt(self.settings)),
-            Message(role="system", content="Project state (JSON):\n" + json.dumps(self._state(), ensure_ascii=False)),
+            self._overview_message(),
+            self._state_message(),
         ]
 
     def _analysis_user(self, original_title: str, original_content: str) -> str:
@@ -345,7 +375,6 @@ class _BaseWebNovel:
         return "Now link the glossary names in the chapter you just produced, changing nothing else."
 
     def _apply_glossary_and_context(self, glossary_updates: list[GlossaryUpdate], context: ContextUpdate | None) -> None:
-        self._check_glossary_policy(glossary_updates)
         for update in glossary_updates:
             self._apply_glossary_update(update)
         if context is not None:
@@ -369,8 +398,6 @@ class _BaseWebNovel:
     def _apply_draft(
         self, draft: ChapterDraft, original_title: str, original_content: str, analysis: ChapterAnalysis
     ) -> Chapter:
-        if not self.settings.allow_chapter_reorder and draft.position is not None:
-            raise TranslationError("chapter reorder not allowed")
         chapter = draft.to_chapter(original_title, original_content, analysis.kind, analysis.summary)
         if draft.position is None:
             self.chapters.append(chapter)
@@ -405,10 +432,27 @@ class _BaseWebNovel:
         ]
         for op, action, allowed, limit in checks:
             if counts[op] and not allowed:
-                raise TranslationError(f"glossary {action} not allowed")
+                raise _Retryable(f"glossary {action} not allowed")
             if counts[op] > limit:
-                raise TranslationError(f"exceeds glossary {action} limit: {limit}")
+                raise _Retryable(f"exceeds glossary {action} limit: {limit}")
         self._check_glossary_references(updates)
+
+    def _check_reorder(self, position: int | None) -> None:
+        if position is not None and not self.settings.allow_chapter_reorder:
+            raise _Retryable("chapter reorder not allowed")
+
+    def _validate_result(self, result: object) -> None:
+        """Validate a parsed result's term refs and policy, raising _Retryable so _ask can retry."""
+        self._check_term_refs(result)
+        if isinstance(result, ChapterAnalysis):
+            self._check_glossary_policy(result.glossary_updates)
+        elif isinstance(result, ChapterCleanup):
+            self._check_glossary_policy(result.glossary_updates)
+            self._check_reorder(result.position)
+        elif isinstance(result, ChapterDraft):
+            self._check_reorder(result.position)
+        elif isinstance(result, TranslationResponse):
+            self._check_policy(result)
 
     def _check_term_refs(self, result: object) -> None:
         """Validate that every content term node points at a real entry and one of its own aliases.
@@ -458,20 +502,19 @@ class _BaseWebNovel:
                 continue
             entry = self.glossary.get(update.target_id)
             if update.op is GlossaryOp.DELETE and update.target_id in term_ids:
-                raise TranslationError(f"cannot delete glossary entry in use by a chapter: {update.target_id}")
+                raise _Retryable(f"cannot delete glossary entry in use by a chapter: {update.target_id}")
             if update.op is GlossaryOp.EDIT and entry is not None:
                 kept = {suggestion.original for suggestion in update.aliases}
                 if any(alias.id in alias_ids and alias.original not in kept for alias in entry.aliases):
-                    raise TranslationError(f"cannot drop glossary alias in use by a chapter: {update.target_id}")
+                    raise _Retryable(f"cannot drop glossary alias in use by a chapter: {update.target_id}")
 
     def _check_policy(self, response: TranslationResponse) -> None:
         self._check_glossary_policy(response.glossary_updates)
         ids = {chapter.id for chapter in self.chapters}
         for payload in response.chapters:
             if payload.target_id is not None and payload.target_id not in ids:
-                raise TranslationError(f"unknown chapter target_id: {payload.target_id}")
-        if not self.settings.allow_chapter_reorder and any(payload.position is not None for payload in response.chapters):
-            raise TranslationError("chapter reorder not allowed")
+                raise _Retryable(f"unknown chapter target_id: {payload.target_id}")
+            self._check_reorder(payload.position)
 
     def _apply_glossary_update(self, update: GlossaryUpdate) -> None:
         if update.op is GlossaryOp.DELETE:
@@ -647,12 +690,12 @@ class WebNovel(_BaseWebNovel):
             try:
                 result = parse(self._validate(raw, schema))
                 if not isinstance(result, TranslationRequest):
-                    self._check_term_refs(result)
-            except _SchemaError as error:
+                    self._validate_result(result)
+            except _Retryable as error:
                 if schema_retries <= 0:
-                    raise TranslationError("response schema invalid") from error
+                    raise TranslationError(error.final) from error
                 schema_retries -= 1
-                conversation.append(Message(role="system", content=_schema_correction(error.detail)))
+                conversation.append(Message(role="system", content=_correction(error.detail)))
                 continue
             if isinstance(result, TranslationRequest):
                 rounds -= 1
@@ -698,7 +741,6 @@ class WebNovel(_BaseWebNovel):
         merged = TranslationResponse()
         for _ in range(_MAX_CONTINUATION_ROUNDS):
             response = self._ask(conversation, schema, parse_model_output)
-            self._check_policy(response)
             self.apply_response(response)
             self._merge_response(merged, response)
             if not response.more:
@@ -717,14 +759,14 @@ class WebNovel(_BaseWebNovel):
             raw = self.provider.complete(conversation, response_format=fmt)
             try:
                 return parse(raw)
-            except _SchemaError as error:
+            except _Retryable as error:
                 if retries <= 0:
-                    raise TranslationError("response schema invalid") from error
+                    raise TranslationError(error.final) from error
                 retries -= 1
                 conversation = [
                     *conversation,
                     Message(role="assistant", content=raw),
-                    Message(role="system", content=_schema_correction(error.detail)),
+                    Message(role="system", content=_correction(error.detail)),
                 ]
 
 
@@ -842,12 +884,12 @@ class AsyncWebNovel(_BaseWebNovel):
             try:
                 result = parse(self._validate(raw, schema))
                 if not isinstance(result, TranslationRequest):
-                    self._check_term_refs(result)
-            except _SchemaError as error:
+                    self._validate_result(result)
+            except _Retryable as error:
                 if schema_retries <= 0:
-                    raise TranslationError("response schema invalid") from error
+                    raise TranslationError(error.final) from error
                 schema_retries -= 1
-                conversation.append(Message(role="system", content=_schema_correction(error.detail)))
+                conversation.append(Message(role="system", content=_correction(error.detail)))
                 continue
             if isinstance(result, TranslationRequest):
                 rounds -= 1
@@ -893,7 +935,6 @@ class AsyncWebNovel(_BaseWebNovel):
         merged = TranslationResponse()
         for _ in range(_MAX_CONTINUATION_ROUNDS):
             response = await self._ask(conversation, schema, parse_model_output)
-            self._check_policy(response)
             self.apply_response(response)
             self._merge_response(merged, response)
             if not response.more:
@@ -912,12 +953,12 @@ class AsyncWebNovel(_BaseWebNovel):
             raw = await self.provider.complete(conversation, response_format=fmt)
             try:
                 return parse(raw)
-            except _SchemaError as error:
+            except _Retryable as error:
                 if retries <= 0:
-                    raise TranslationError("response schema invalid") from error
+                    raise TranslationError(error.final) from error
                 retries -= 1
                 conversation = [
                     *conversation,
                     Message(role="assistant", content=raw),
-                    Message(role="system", content=_schema_correction(error.detail)),
+                    Message(role="system", content=_correction(error.detail)),
                 ]

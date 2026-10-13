@@ -471,8 +471,8 @@ async def _ws(request: web.Request) -> web.WebSocketResponse:
             await event.wait()
             event.clear()
             await ws.send_json(translator.snapshot())
-    except (ConnectionResetError, asyncio.CancelledError):
-        pass
+    except (ConnectionError, asyncio.CancelledError):
+        pass  # the client went away; stop pushing to it
     finally:
         translator.listeners.discard(event)
     return ws
@@ -518,7 +518,7 @@ def main() -> int:
     parser.add_argument(
         "--reasoning-effort",
         choices=["off", *(effort.value for effort in ReasoningEffort)],
-        default=ReasoningEffort.LOW.value,
+        default=ReasoningEffort.NONE.value,
         help="Reasoning effort to request; 'off' omits the field for endpoints that reject it",
     )
     parser.add_argument("--source-language", default="Japanese")

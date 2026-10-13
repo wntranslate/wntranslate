@@ -306,6 +306,24 @@ def test_schema_invalid_bad_json() -> None:
         wn.request_change("x")
 
 
+def test_policy_violation_is_fed_back_and_recovers() -> None:
+    over = TranslationResponse(
+        glossary_updates=[
+            GlossaryUpdate(op=GlossaryOp.NEW, name="A", original_name="あ", type=NameType.PERSON),
+            GlossaryUpdate(op=GlossaryOp.NEW, name="B", original_name="い", type=NameType.PERSON),
+        ]
+    )
+    ok = TranslationResponse(
+        glossary_updates=[GlossaryUpdate(op=GlossaryOp.NEW, name="A", original_name="あ", type=NameType.PERSON)]
+    )
+    provider = FakeProvider([_dump(over), _dump(ok)])
+    wn = WebNovel("src", "", settings=TranslationSettings(glossary_add_limit=1), provider=provider)
+    wn.request_change("add names")
+    assert provider.calls == 2
+    assert len(wn.glossary) == 1
+    assert any("exceeds glossary add limit" in m.content for m in provider.last_messages)
+
+
 def test_schema_retry_then_succeeds() -> None:
     provider = FakeProvider(["not json", _analysis(), _draft(title="Ch1")])
     wn = WebNovel("src", "", provider=provider)
@@ -314,7 +332,7 @@ def test_schema_retry_then_succeeds() -> None:
     assert provider.calls == 5
     assert len(wn.chapters) == 1
     assert any(m.role == "assistant" and m.content == "not json" for m in provider.last_messages)
-    assert any("did not match" in m.content for m in provider.last_messages)
+    assert any("was rejected" in m.content for m in provider.last_messages)
 
 
 def test_schema_retry_gives_up_after_limit() -> None:

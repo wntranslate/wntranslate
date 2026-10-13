@@ -63,7 +63,7 @@ def test_deepseek_preset() -> None:
     provider = DeepSeekProvider(model="deepseek-chat")
     assert provider.supports_schema is False
     assert provider.base_url == "https://api.deepseek.com/v1"
-    assert provider.reasoning_effort is ReasoningEffort.LOW
+    assert provider.reasoning_effort is ReasoningEffort.NONE
 
 
 def _capture_body(monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]) -> None:
@@ -74,18 +74,18 @@ def _capture_body(monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]) -> 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
 
-def test_reasoning_effort_defaults_to_low(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reasoning_effort_defaults_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
     _capture_body(monkeypatch, captured)
     OpenAIProvider(model="m").complete([Message(role="user", content="hi")])
-    assert captured["body"]["reasoning_effort"] == "low"
+    assert captured["body"]["reasoning_effort"] == "none"
 
 
 def test_reasoning_effort_custom_level(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
     _capture_body(monkeypatch, captured)
-    OpenAIProvider(model="m", reasoning_effort=ReasoningEffort.NONE).complete([Message(role="user", content="hi")])
-    assert captured["body"]["reasoning_effort"] == "none"
+    OpenAIProvider(model="m", reasoning_effort=ReasoningEffort.HIGH).complete([Message(role="user", content="hi")])
+    assert captured["body"]["reasoning_effort"] == "high"
 
 
 def test_reasoning_effort_omitted_when_none(monkeypatch: pytest.MonkeyPatch) -> None:

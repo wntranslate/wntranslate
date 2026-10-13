@@ -59,7 +59,7 @@ class OpenAIProvider(Provider):
     timeout: float | None = 600.0
     temperature: float | None = 0.3
     supports_schema: bool = True
-    reasoning_effort: ReasoningEffort | None = ReasoningEffort.LOW
+    reasoning_effort: ReasoningEffort | None = ReasoningEffort.NONE
     headers: dict[str, str] = field(default_factory=dict)
     stream: bool = False
     on_token: Callable[[str], None] | None = None
