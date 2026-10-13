@@ -7,8 +7,14 @@ from typing import Any, Self
 import aiohttp
 import pytest
 
-from wntranslate import AnthropicProvider, Message, ProviderError, Usage
-from wntranslate.providers.anthropic import _build_body
+from wntranslate import (
+    AnthropicProvider,
+    Message,
+    ProviderError,
+    Usage,
+    json_schema_format,
+)
+from wntranslate.providers.anthropic import _build_body, _force_tool
 from wntranslate.providers.async_anthropic import AsyncAnthropicProvider
 
 
@@ -44,35 +50,54 @@ def _reply(text: str) -> bytes:
     return json.dumps({"content": [{"type": "text", "text": text}]}).encode("utf-8")
 
 
-def test_anthropic_request(monkeypatch: pytest.MonkeyPatch) -> None:
+_SCHEMA = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}
+
+
+def _tool_reply(data: dict[str, Any]) -> bytes:
+    return json.dumps({"content": [{"type": "tool_use", "name": "wn", "input": data}]}).encode("utf-8")
+
+
+def test_anthropic_forces_tool_for_schema(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
 
     def fake_urlopen(request: urllib.request.Request, timeout: float | None = None) -> _FakeResponse:
         captured["url"] = request.full_url
         captured["headers"] = {k.lower(): v for k, v in request.headers.items()}
         captured["body"] = json.loads(request.data.decode("utf-8")) if request.data else None
-        return _FakeResponse(_reply('"ok": true}'))
+        return _FakeResponse(_tool_reply({"ok": True}))
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     provider = AnthropicProvider(model="claude-x", api_key="sk", max_tokens=1234)
     out = provider.complete(
         [Message(role="system", content="sys one"), Message(role="system", content="sys two"), Message(role="user", content="hi")],
-        response_format={"type": "json_schema"},
+        response_format=json_schema_format("wn", _SCHEMA),
     )
-    assert out == '{"ok": true}'  # the forced-JSON prefix plus the model's continuation
+    assert json.loads(out) == {"ok": True}  # the forced tool's input, returned as JSON
     assert captured["url"] == "https://api.anthropic.com/v1/messages"
     assert captured["headers"]["x-api-key"] == "sk"
     assert captured["headers"]["anthropic-version"]
     assert captured["body"]["model"] == "claude-x"
     assert captured["body"]["max_tokens"] == 1234
     assert "temperature" not in captured["body"]
+    assert captured["body"]["tool_choice"] == {"type": "tool", "name": "wn"}
+    tool = captured["body"]["tools"][0]
+    assert tool["name"] == "wn"
+    assert tool["input_schema"] == _SCHEMA
+    assert tool["cache_control"] == {"type": "ephemeral"}
     assert captured["body"]["system"] == [
         {"type": "text", "text": "sys one\n\nsys two", "cache_control": {"type": "ephemeral"}}
     ]
+    # No assistant prefill: the conversation ends with the user turn.
     assert captured["body"]["messages"] == [
-        {"role": "user", "content": "hi"},
-        {"role": "assistant", "content": [{"type": "text", "text": "{", "cache_control": {"type": "ephemeral"}}]},
+        {"role": "user", "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]},
     ]
+
+
+def test_force_tool_wraps_root_oneof() -> None:
+    body: dict[str, Any] = {}
+    _force_tool(body, "wn", {"oneOf": [{"type": "object"}, {"type": "object"}]})
+    assert body["tools"][0]["input_schema"] == {"type": "object", "oneOf": [{"type": "object"}, {"type": "object"}]}
+    assert body["tool_choice"] == {"type": "tool", "name": "wn"}
 
 
 def test_anthropic_no_key_omits_header(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -145,13 +170,12 @@ def test_build_body_collapses_system_and_merges_roles() -> None:
         Message(role="system", content="data"),
         Message(role="user", content="u2"),
     ]
-    body = _build_body("m", messages, 8192, "{", None)
+    body = _build_body("m", messages, 8192, None)
     assert body["system"] == [{"type": "text", "text": "base", "cache_control": {"type": "ephemeral"}}]
     assert body["messages"] == [
         {"role": "user", "content": "u1"},
         {"role": "assistant", "content": "a1"},
-        {"role": "user", "content": "data\n\nu2"},
-        {"role": "assistant", "content": [{"type": "text", "text": "{", "cache_control": {"type": "ephemeral"}}]},
+        {"role": "user", "content": [{"type": "text", "text": "data\n\nu2", "cache_control": {"type": "ephemeral"}}]},
     ]
 
 
@@ -190,17 +214,15 @@ class _FakeSession:
 
 def test_async_anthropic_complete(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
-    resp = _FakeResp(200, _reply('"ok": true}'))
+    resp = _FakeResp(200, _tool_reply({"ok": True}))
     monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **k: _FakeSession(resp, captured))
     provider = AsyncAnthropicProvider(model="claude-x", api_key="sk")
-    out = asyncio.run(provider.complete([Message(role="user", content="hi")], response_format={"x": 1}))
-    assert out == '{"ok": true}'
+    out = asyncio.run(provider.complete([Message(role="user", content="hi")], response_format=json_schema_format("wn", _SCHEMA)))
+    assert json.loads(out) == {"ok": True}
     assert captured["url"] == "https://api.anthropic.com/v1/messages"
     assert captured["headers"]["x-api-key"] == "sk"
-    assert captured["json"]["messages"][-1] == {
-        "role": "assistant",
-        "content": [{"type": "text", "text": "{", "cache_control": {"type": "ephemeral"}}],
-    }
+    assert captured["json"]["tool_choice"] == {"type": "tool", "name": "wn"}
+    assert captured["json"]["messages"][-1]["role"] == "user"
 
 
 def test_async_anthropic_http_error(monkeypatch: pytest.MonkeyPatch) -> None:
