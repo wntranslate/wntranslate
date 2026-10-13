@@ -1,0 +1,198 @@
+from __future__ import annotations
+
+import json
+import urllib.error
+import urllib.request
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
+from typing import Any
+
+from .base import Message, Provider
+
+
+class ProviderError(RuntimeError):
+    """Raised when a provider request fails."""
+
+
+@dataclass
+class OpenAIProvider(Provider):
+    """Client for any OpenAI-compatible chat completions API.
+
+    Args:
+        model: Model name to request.
+        api_key: Bearer token, or None for endpoints that need none.
+        base_url: API base URL without the endpoint path.
+        timeout: Request timeout in seconds, or None for no limit.
+        temperature: Sampling temperature, or None to use the API default.
+        supports_schema: Whether the API supports a json_schema response_format;
+            when False, the schema is added to the prompt and JSON mode is used.
+        headers: Extra headers to send.
+        stream: Whether to stream the response (and call on_token per piece).
+        on_token: Callback invoked with each streamed text piece.
+    """
+
+    model: str
+    api_key: str | None = None
+    base_url: str = "https://api.openai.com/v1"
+    timeout: float | None = 600.0
+    temperature: float | None = 0.3
+    supports_schema: bool = True
+    headers: dict[str, str] = field(default_factory=dict)
+    stream: bool = False
+    on_token: Callable[[str], None] | None = None
+
+    def complete(
+        self,
+        messages: Sequence[Message],
+        *,
+        response_format: dict[str, Any] | None = None,
+        extra_body: dict[str, Any] | None = None,
+    ) -> str:
+        """Send a chat completion request and return the assistant text.
+
+        Args:
+            messages: The conversation messages.
+            response_format: Provider response_format object, or None.
+            extra_body: Extra fields merged into the request body.
+
+        Returns:
+            The assistant message content.
+        """
+        body = _build_body(self.model, messages, response_format, self.temperature, self.supports_schema, extra_body)
+        if self.stream:
+            return self._stream(body)
+        payload = self._post(body)
+        try:
+            content = payload["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as error:
+            raise ProviderError(f"unexpected response: {payload!r}") from error
+        if not isinstance(content, str):
+            raise ProviderError(f"non-text content: {content!r}")
+        return content
+
+    def _request(self, body: dict[str, Any]) -> urllib.request.Request:
+        headers = {"Content-Type": "application/json", **self.headers}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        return urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
+
+    def _post(self, body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            with urllib.request.urlopen(self._request(body), timeout=self.timeout) as response:
+                decoded = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", "replace")
+            raise ProviderError(f"{error.code} {error.reason}: {detail}") from error
+        except urllib.error.URLError as error:
+            raise ProviderError(str(error.reason)) from error
+        if not isinstance(decoded, dict):
+            raise ProviderError(f"expected a JSON object, got {type(decoded).__name__}")
+        return decoded
+
+    def _stream(self, body: dict[str, Any]) -> str:
+        request = self._request({**body, "stream": True})
+        pieces: list[str] = []
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                for raw_line in response:
+                    line = raw_line.decode("utf-8").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[len("data:") :].strip()
+                    if data == "[DONE]":
+                        break
+                    self._consume(data, pieces)
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", "replace")
+            raise ProviderError(f"{error.code} {error.reason}: {detail}") from error
+        except urllib.error.URLError as error:
+            raise ProviderError(str(error.reason)) from error
+        return "".join(pieces)
+
+    def _consume(self, data: str, pieces: list[str]) -> None:
+        content, reasoning = _delta(data)
+        if reasoning and self.on_token is not None:
+            self.on_token(reasoning)
+        if content:
+            pieces.append(content)
+            if self.on_token is not None:
+                self.on_token(content)
+
+
+@dataclass
+class DeepSeekProvider(OpenAIProvider):
+    """OpenAIProvider preset for DeepSeek, which supports only json_object output."""
+
+    base_url: str = "https://api.deepseek.com/v1"
+    supports_schema: bool = False
+
+
+def _schema_of(response_format: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the JSON schema inside a json_schema response_format, if any."""
+    if response_format.get("type") != "json_schema":
+        return None
+    schema = response_format.get("json_schema", {}).get("schema")
+    return schema if isinstance(schema, dict) else None
+
+
+def _build_body(
+    model: str,
+    messages: Sequence[Message],
+    response_format: dict[str, Any] | None,
+    temperature: float | None,
+    supports_schema: bool,
+    extra_body: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Build the chat completion request body.
+
+    A json_schema response_format is downgraded to json_object when the endpoint cannot
+    enforce a schema; callers that need the schema in the prompt must include it themselves.
+    """
+    chat = [{"role": message.role, "content": message.content} for message in messages]
+    body: dict[str, Any] = {"model": model, "messages": chat}
+    if response_format is not None:
+        if not supports_schema and _schema_of(response_format) is not None:
+            body["response_format"] = {"type": "json_object"}
+        else:
+            body["response_format"] = response_format
+    if temperature is not None:
+        body["temperature"] = temperature
+    if extra_body:
+        body.update(extra_body)
+    return body
+
+
+def _delta(data: str) -> tuple[str, str]:
+    """Extract the (content, reasoning_content) pieces from one SSE data payload.
+
+    Args:
+        data: The JSON text after a 'data:' prefix.
+
+    Returns:
+        A (content, reasoning) pair; each is an empty string when absent.
+    """
+    try:
+        event = json.loads(data)
+    except json.JSONDecodeError:
+        return "", ""
+    if not isinstance(event, dict) or not event.get("choices"):
+        return "", ""
+    delta = event["choices"][0].get("delta") or {}
+    content = delta.get("content")
+    reasoning = delta.get("reasoning_content")
+    return (content if isinstance(content, str) else ""), (reasoning if isinstance(reasoning, str) else "")
+
+
+def json_schema_format(name: str, schema: dict[str, Any], *, strict: bool = False) -> dict[str, Any]:
+    """Build a response_format for OpenAI-style json_schema output.
+
+    Args:
+        name: Schema name.
+        schema: The JSON schema.
+        strict: Whether to request strict adherence.
+
+    Returns:
+        A response_format object.
+    """
+    return {"type": "json_schema", "json_schema": {"name": name, "schema": schema, "strict": strict}}

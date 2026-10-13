@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wntranslate"
+dynamic = ["version"]
+description = "Simple yet comprehensive AI-assisted webnovel translation tool. Keeps track with a glossary, notes, and context."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "YumYummity", email = "yumyummity@gmail.com" }]
+dependencies = ["jsonschema>=4.18", "markdown-it-py>=3.0"]
+
+[project.optional-dependencies]
+async = ["aiohttp>=3.9"]
+dev = ["pytest", "mypy", "ruff", "types-jsonschema", "aiohttp>=3.9"]
+
+[tool.hatch.version]
+path = "src/wntranslate/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wntranslate"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+strict = true
+packages = ["wntranslate"]
+
+[tool.ruff]
+src = ["src"]
+
+[tool.pyright]
+extraPaths = ["src"]

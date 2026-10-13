@@ -1,0 +1,414 @@
+"""Lazily translate a directory of numbered chapter text files and serve them over HTTP.
+
+Files are numbered (e.g. 0001.txt, 2.txt, 000003.txt) and sorted by that number.
+Each file has its title on the first line and its content on the rest. Chapters are
+translated on demand by an async worker: visiting one starts translating it (and up to
+--pretranslate chapters ahead) and the page auto-reloads when ready; already-translated
+chapters stay servable while another chapter is translating. The project is saved after
+each chapter finishes.
+
+    python examples/translate_directory.py ./chapters \
+        --model gpt-4o-mini --base-url https://api.openai.com/v1 --api-key sk-... --pretranslate 5 --stream
+
+    python examples/translate_directory.py ./chapters \
+        --provider deepseek --model deepseek-chat --api-key sk-... --stream
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import sys
+import time
+from collections.abc import Sequence
+from html import escape
+from pathlib import Path
+from typing import Any
+
+from aiohttp import web
+
+from wntranslate import (
+    AsyncProvider,
+    AsyncWebNovel,
+    Chapter,
+    Creativity,
+    Message,
+    TranslationSettings,
+)
+from wntranslate.providers.async_openai import (
+    AsyncDeepSeekProvider,
+    AsyncOpenAIProvider,
+)
+from wntranslate.render import render_content_html
+
+_PROVIDERS = {"openai": AsyncOpenAIProvider, "deepseek": AsyncDeepSeekProvider}
+
+_CSS = """
+body { margin: 0; background: #fdfdfc; color: #1a1a1a; font-family: Georgia, serif; line-height: 1.7; }
+@media (prefers-color-scheme: dark) { body { background: #1a1a1a; color: #e6e6e6; } }
+.wrap { max-width: 42rem; margin: 0 auto; padding: 0 16px 4rem; }
+.nav { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 16px;
+       border-bottom: 1px solid #8884; font-family: system-ui, sans-serif; position: sticky; top: 0; background: inherit; }
+.nav a { color: #3b5bdb; text-decoration: none; }
+.nav .disabled { opacity: 0.35; }
+.synopsis { color: #555; font-size: 0.95rem; }
+@media (prefers-color-scheme: dark) { .synopsis { color: #aaa; } }
+.toc-list { font-family: system-ui, sans-serif; line-height: 2; padding-left: 1.4rem; }
+.toc-list a { color: #3b5bdb; text-decoration: none; }
+.badge { font-size: 0.8rem; color: #888; }
+.status { text-align: center; margin-top: 4rem; font-family: system-ui, sans-serif; color: #666; }
+.stream { white-space: pre-wrap; word-break: break-word; font-size: 0.8rem; color: #888; background: #8881; padding: 12px; border-radius: 6px; }
+.error { color: #c92a2a; white-space: pre-wrap; }
+.footnotes { margin-top: 2.5rem; border-top: 1px solid #8884; padding-top: 1rem; font-size: 0.9rem; }
+.footnotes a.footnote-back { color: inherit; text-decoration: none; }
+"""
+
+_BADGES = {"done": "done", "translating": "translating…", "error": "failed", "pending": ""}
+
+
+def load_chapter(path: Path) -> tuple[str, str]:
+    """Split a file into its title (first line) and content (the rest).
+
+    Args:
+        path: The chapter file.
+
+    Returns:
+        A (title, content) pair.
+    """
+    title, _, content = path.read_text(encoding="utf-8").partition("\n")
+    return title.strip(), content.strip()
+
+
+def _nav(index: int, total: int) -> str:
+    prev = f'<a href="/chapter/{index - 1}">&larr; Prev</a>' if index > 0 else '<span class="disabled">&larr; Prev</span>'
+    nxt = (
+        f'<a href="/chapter/{index + 1}">Next &rarr;</a>'
+        if index < total - 1
+        else '<span class="disabled">Next &rarr;</span>'
+    )
+    return f'<nav class="nav">{prev}<a href="/">Chapter {index + 1} / {total}</a>{nxt}</nav>'
+
+
+def _page(title: str, body: str, *, refresh: int | None = None) -> bytes:
+    meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh is not None else ""
+    document = (
+        f'<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+        f'<meta name="viewport" content="width=device-width, initial-scale=1">{meta}'
+        f"<title>{escape(title)}</title><style>{_CSS}</style></head><body>{body}</body></html>"
+    )
+    return document.encode("utf-8")
+
+
+class LoggingProvider(AsyncProvider):
+    """Wraps an async provider and prints each request's messages and response."""
+
+    def __init__(self, inner: AsyncProvider) -> None:
+        self.inner = inner
+
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        *,
+        response_format: dict[str, Any] | None = None,
+        extra_body: dict[str, Any] | None = None,
+    ) -> str:
+        for message in messages:
+            print(f"\n--- {message.role} ---\n{message.content}", file=sys.stderr)
+        reply = await self.inner.complete(messages, response_format=response_format, extra_body=extra_body)
+        print(f"\n--- response ---\n{reply}\n", file=sys.stderr)
+        return reply
+
+
+class Translator:
+    """Owns the project, an async translation worker, per-chapter state, and autosave."""
+
+    def __init__(self, project: AsyncWebNovel, sources: list[tuple[str, str]], pretranslate: int, save_path: Path) -> None:
+        self.project = project
+        self.sources = sources
+        self.pretranslate = pretranslate
+        self.save_path = save_path
+        self.status: dict[int, str] = {}
+        self.errors: dict[int, str] = {}
+        self.translated: dict[int, Chapter] = {}
+        self.pending: set[int] = set()
+        self.requested: int | None = None
+        self.metadata_state = "done" if project.title is not None else "pending"
+        self.stream_text: dict[int, str] = {}
+        self.token_counts: dict[int, int] = {}
+        self._streaming: int | None = None
+        self.cond = asyncio.Condition()
+        self._seed_from_project()
+
+    def feed_token(self, piece: str) -> None:
+        """Append a streamed token to the chapter currently being translated."""
+        if self._streaming is not None:
+            self.stream_text[self._streaming] = self.stream_text.get(self._streaming, "") + piece
+            self.token_counts[self._streaming] = self.token_counts.get(self._streaming, 0) + 1
+
+    def start(self) -> None:
+        asyncio.create_task(self._run())
+        if self.metadata_state == "pending":
+            asyncio.create_task(self._translate_metadata())
+
+    async def _translate_metadata(self) -> None:
+        async with self.cond:
+            self.metadata_state = "translating"
+            self.cond.notify_all()
+        started = time.monotonic()
+        try:
+            await self.project.translate_metadata()
+            self._save()
+        except Exception as exc:  # noqa: BLE001 - surface any failure and keep serving
+            state = "error"
+            print(f"Failed metadata translation after {time.monotonic() - started:.1f}s: {exc}", file=sys.stderr)
+        else:
+            state = "done"
+            print(f"Translated metadata in {time.monotonic() - started:.1f}s", file=sys.stderr)
+        async with self.cond:
+            self.metadata_state = state
+            self.cond.notify_all()
+
+    def _seed_from_project(self) -> None:
+        claimed: set[int] = set()
+        for chapter in self.project.chapters:
+            key = (chapter.original_title, chapter.original_content)
+            for index, source in enumerate(self.sources):
+                if index not in claimed and source == key:
+                    self.translated[index] = chapter
+                    self.status[index] = "done"
+                    claimed.add(index)
+                    break
+
+    async def _request(self, index: int) -> None:
+        async with self.cond:
+            self.requested = index
+            last = len(self.sources) - 1
+            for candidate in range(index, min(index + self.pretranslate, last) + 1):
+                if self.status.get(candidate) not in ("translating", "done") and candidate not in self.pending:
+                    self.pending.add(candidate)
+            self.cond.notify_all()
+
+    def _next(self) -> int | None:
+        if not self.pending:
+            return None
+        index = self.requested if self.requested in self.pending else min(self.pending)
+        self.pending.discard(index)
+        return index
+
+    async def _run(self) -> None:
+        while True:
+            async with self.cond:
+                index = self._next()
+                while index is None:
+                    await self.cond.wait()
+                    index = self._next()
+                self.status[index] = "translating"
+            await self._translate(index)
+
+    async def _translate(self, index: int) -> None:
+        title, content = self.sources[index]
+        started = time.monotonic()
+        error: str | None = None
+        chapter: Chapter | None = None
+        before = len(self.project.chapters)
+        self.stream_text[index] = ""
+        self.token_counts[index] = 0
+        self._streaming = index
+        try:
+            await self.project.translate_new_chapter(title, content)
+            if len(self.project.chapters) > before:
+                chapter = self.project.chapters[-1]
+                self._save()
+            else:
+                error = "model returned no chapter"
+        except Exception as exc:  # noqa: BLE001 - surface any failure on the chapter page
+            error = str(exc)
+        finally:
+            self._streaming = None
+        elapsed = time.monotonic() - started
+        async with self.cond:
+            if error is not None:
+                self.status[index] = "error"
+                self.errors[index] = error
+                print(f"Failed chapter {index + 1} ({title}) after {elapsed:.1f}s: {error}", file=sys.stderr)
+            else:
+                assert chapter is not None
+                self.translated[index] = chapter
+                self.status[index] = "done"
+                self.stream_text.pop(index, None)
+                tokens = self.token_counts.pop(index, 0)
+                suffix = f" and {tokens} tokens" if tokens else ""
+                print(f"Translated chapter {index + 1} ({chapter.title or title}) in {elapsed:.1f}s{suffix}", file=sys.stderr)
+            self.cond.notify_all()
+
+    def _save(self) -> None:
+        self.save_path.write_text(self.project.dumps(indent=4, separators=(", ", ": ")), encoding="utf-8")
+
+    async def retranslate(self, index: int) -> None:
+        """Drop an existing translation and queue the chapter to translate again."""
+        async with self.cond:
+            chapter = self.translated.pop(index, None)
+            if chapter is not None and chapter in self.project.chapters:
+                self.project.chapters.remove(chapter)
+            self.status.pop(index, None)
+            self.errors.pop(index, None)
+        self._save()
+        await self._request(index)
+
+    def render_toc(self) -> bytes:
+        total = len(self.sources)
+        busy = bool(self.pending) or self.metadata_state == "translating"
+        items = []
+        for index in range(total):
+            state = self.status.get(index, "pending")
+            busy = busy or state == "translating"
+            chapter = self.translated.get(index)
+            title = chapter.title if chapter is not None and chapter.title else self.sources[index][0]
+            items.append(
+                f'<li><a href="/chapter/{index}">{escape(title or f"Chapter {index + 1}")}</a> '
+                f'<span class="badge">{_BADGES.get(state, "")}</span></li>'
+            )
+        heading = escape(self.project.title or self.project.original_title)
+        synopsis = self.project.synopsis or self.project.original_synopsis
+        description = ""
+        if synopsis:
+            paragraphs = "".join(f"<p>{escape(part)}</p>" for part in synopsis.split("\n\n") if part.strip())
+            description = f'<div class="synopsis">{paragraphs}</div>'
+        body = f'<main class="wrap"><h1>{heading}</h1>{description}<ol class="toc-list">{"".join(items)}</ol></main>'
+        return _page("Contents", body, refresh=3 if busy else None)
+
+    async def render_chapter(self, index: int) -> bytes:
+        await self._request(index)
+        total = len(self.sources)
+        async with self.cond:
+            state = self.status.get(index, "pending")
+            chapter = self.translated.get(index)
+            error = self.errors.get(index)
+        if state == "done" and chapter is not None:
+            body = render_content_html(chapter.content, self.project.glossary)
+            heading = escape(chapter.title or f"Chapter {index + 1}")
+            retranslate = (
+                f'<form method="post" action="/chapter/{index}/retranslate" class="retranslate">'
+                f"<button>Retranslate</button></form>"
+            )
+            return _page(heading, f'{_nav(index, total)}<main class="wrap"><h1>{heading}</h1>{body}{retranslate}</main>')
+        partial = self.stream_text.get(index)
+        stream = f'<pre class="stream">{escape(partial)}</pre>' if partial else ""
+        if state == "error":
+            message = f'<p class="status error">{escape(error or "error")}</p>'
+            return _page(f"Chapter {index + 1}", f'{_nav(index, total)}<main class="wrap">{message}{stream}</main>')
+        message = f'<p class="status">Translating chapter {index + 1}…</p>'
+        return _page(f"Chapter {index + 1}", f'{_nav(index, total)}<main class="wrap">{message}{stream}</main>', refresh=2)
+
+
+async def _toc(request: web.Request) -> web.Response:
+    translator: Translator = request.app["translator"]
+    return web.Response(body=translator.render_toc(), content_type="text/html", charset="utf-8")
+
+
+async def _chapter(request: web.Request) -> web.Response:
+    translator: Translator = request.app["translator"]
+    raw = request.match_info["index"]
+    if not raw.isdigit() or not (0 <= int(raw) < len(translator.sources)):
+        raise web.HTTPNotFound
+    return web.Response(body=await translator.render_chapter(int(raw)), content_type="text/html", charset="utf-8")
+
+
+async def _retranslate(request: web.Request) -> web.Response:
+    translator: Translator = request.app["translator"]
+    raw = request.match_info["index"]
+    if not raw.isdigit() or not (0 <= int(raw) < len(translator.sources)):
+        raise web.HTTPNotFound
+    await translator.retranslate(int(raw))
+    raise web.HTTPFound(f"/chapter/{raw}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Lazily translate and serve a directory of numbered chapter files.")
+    parser.add_argument("directory", type=Path, help="Directory of numbered .txt chapter files")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--pretranslate", type=int, default=0, help="Chapters to translate ahead in the background")
+    parser.add_argument("--save", type=Path, default=None, help="Project JSON path (default: <directory>.wnt.json)")
+    parser.add_argument("--provider", choices=_PROVIDERS, default="openai", help="Provider preset to use")
+    parser.add_argument("--model", required=True, help="Model name")
+    parser.add_argument("--base-url", default=None, help="API base URL (required unless the provider supplies one)")
+    parser.add_argument("--api-key", default=None, help="API key (omit for endpoints that need none)")
+    parser.add_argument("--timeout", type=float, default=600.0, help="Request timeout in seconds (0 for no limit)")
+    parser.add_argument("--source-language", default="Japanese")
+    parser.add_argument("--target-language", default="English")
+    parser.add_argument("--additional-context", default=None)
+    parser.add_argument("--stream", action="store_true", help="Stream and print generated tokens as they arrive")
+    parser.add_argument("--show-logs", action="store_true", help="Print each request's messages and response")
+    args = parser.parse_args()
+    if args.base_url is None and args.provider == "openai":
+        parser.error("--base-url is required for --provider openai")
+
+    files = sorted((path for path in args.directory.iterdir() if path.suffix == ".txt"), key=lambda path: int(path.stem))
+    if not files:
+        print(f"No .txt files found in {args.directory}", file=sys.stderr)
+        return 1
+
+    provider_kwargs: dict[str, Any] = {
+        "model": args.model,
+        "api_key": args.api_key,
+        "timeout": args.timeout if args.timeout > 0 else None,
+        "stream": args.stream,
+    }
+    if args.base_url is not None:
+        provider_kwargs["base_url"] = args.base_url
+    base_provider = _PROVIDERS[args.provider](**provider_kwargs)
+    provider: AsyncProvider = LoggingProvider(base_provider) if args.show_logs else base_provider
+
+    save_path = args.save if args.save is not None else Path(f"{args.directory.name}.wnt.json")
+    if save_path.exists():
+        project = AsyncWebNovel.loads(save_path.read_text(encoding="utf-8"))
+        project.provider = provider
+        print(f"Resumed project from {save_path}", file=sys.stderr)
+    else:
+        project = AsyncWebNovel(
+            args.directory.name,
+            "",
+            settings=TranslationSettings(
+                source_language=args.source_language,
+                target_language=args.target_language,
+                additional_context=args.additional_context,
+                creativity=Creativity.MEDIUM
+            ),
+            provider=provider,
+        )
+
+    translator = Translator(project, [load_chapter(path) for path in files], max(args.pretranslate, 0), save_path)
+
+    if args.stream:
+
+        def on_token(piece: str) -> None:
+            translator.feed_token(piece)
+            sys.stderr.buffer.write(piece.encode("utf-8", "replace"))
+            sys.stderr.buffer.flush()
+
+        base_provider.on_token = on_token
+
+    app = web.Application()
+    app["translator"] = translator
+    app.add_routes(
+        [
+            web.get("/", _toc),
+            web.get("/chapter/{index}", _chapter),
+            web.post("/chapter/{index}/retranslate", _retranslate),
+        ]
+    )
+    app.on_startup.append(lambda _: _start(translator))
+
+    done = sum(1 for state in translator.status.values() if state == "done")
+    print(f"Serving {len(files)} chapters ({done} already translated) at http://127.0.0.1:{args.port}/", file=sys.stderr)
+    print(f"Saving project to {save_path}", file=sys.stderr)
+    web.run_app(app, host="0.0.0.0", port=args.port, print=None)
+    return 0
+
+
+async def _start(translator: Translator) -> None:
+    translator.start()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
