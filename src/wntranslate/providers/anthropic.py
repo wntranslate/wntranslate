@@ -24,7 +24,6 @@ class AnthropicProvider(Provider):
         api_key: Anthropic API key, or None for endpoints that need none.
         base_url: API base URL without the endpoint path.
         timeout: Request timeout in seconds, or None for no limit.
-        temperature: Sampling temperature (0-1), or None to use the API default.
         max_tokens: Maximum tokens to generate; required by the API.
         anthropic_version: Value sent as the anthropic-version header.
         headers: Extra headers to send.
@@ -37,7 +36,6 @@ class AnthropicProvider(Provider):
     api_key: str | None = None
     base_url: str = "https://api.anthropic.com/v1"
     timeout: float | None = 1200.0
-    temperature: float | None = 0.4
     max_tokens: int = 8192
     anthropic_version: str = _ANTHROPIC_VERSION
     headers: dict[str, str] = field(default_factory=dict)
@@ -65,7 +63,7 @@ class AnthropicProvider(Provider):
             The assistant message content.
         """
         prefill = "{" if response_format is not None else None
-        body = _build_body(self.model, messages, self.temperature, self.max_tokens, prefill, extra_body)
+        body = _build_body(self.model, messages, self.max_tokens, prefill, extra_body)
         if self.stream:
             text = self._stream(body)
         else:
@@ -130,7 +128,6 @@ class AnthropicProvider(Provider):
 def _build_body(
     model: str,
     messages: Sequence[Message],
-    temperature: float | None,
     max_tokens: int,
     prefill: str | None,
     extra_body: dict[str, Any] | None,
@@ -139,7 +136,8 @@ def _build_body(
 
     Leading system messages become the top-level ``system`` prompt; any later system message
     is treated as a user turn. Consecutive same-role turns are merged so the roles alternate,
-    and ``prefill`` (when given) is appended as an assistant turn to force its start.
+    and ``prefill`` (when given) is appended as an assistant turn to force its start. Temperature
+    is intentionally not sent: some current models deprecate it on this endpoint.
     """
     system_parts: list[str] = []
     turns: list[dict[str, Any]] = []
@@ -163,8 +161,6 @@ def _build_body(
     system = "\n\n".join(system_parts)
     if system:
         body["system"] = [_cached(system)]
-    if temperature is not None:
-        body["temperature"] = temperature
     if extra_body:
         body.update(extra_body)
     return body

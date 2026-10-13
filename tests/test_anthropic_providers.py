@@ -54,7 +54,7 @@ def test_anthropic_request(monkeypatch: pytest.MonkeyPatch) -> None:
         return _FakeResponse(_reply('"ok": true}'))
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    provider = AnthropicProvider(model="claude-x", api_key="sk", temperature=0.4, max_tokens=1234)
+    provider = AnthropicProvider(model="claude-x", api_key="sk", max_tokens=1234)
     out = provider.complete(
         [Message(role="system", content="sys one"), Message(role="system", content="sys two"), Message(role="user", content="hi")],
         response_format={"type": "json_schema"},
@@ -65,7 +65,7 @@ def test_anthropic_request(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured["headers"]["anthropic-version"]
     assert captured["body"]["model"] == "claude-x"
     assert captured["body"]["max_tokens"] == 1234
-    assert captured["body"]["temperature"] == 0.4
+    assert "temperature" not in captured["body"]
     assert captured["body"]["system"] == [
         {"type": "text", "text": "sys one\n\nsys two", "cache_control": {"type": "ephemeral"}}
     ]
@@ -145,7 +145,7 @@ def test_build_body_collapses_system_and_merges_roles() -> None:
         Message(role="system", content="data"),
         Message(role="user", content="u2"),
     ]
-    body = _build_body("m", messages, 0.3, 8192, "{", None)
+    body = _build_body("m", messages, 8192, "{", None)
     assert body["system"] == [{"type": "text", "text": "base", "cache_control": {"type": "ephemeral"}}]
     assert body["messages"] == [
         {"role": "user", "content": "u1"},

@@ -28,7 +28,6 @@ class AsyncAnthropicProvider(AsyncProvider):
         api_key: Anthropic API key, or None for endpoints that need none.
         base_url: API base URL without the endpoint path.
         timeout: Request timeout in seconds, or None for no limit.
-        temperature: Sampling temperature (0-1), or None to use the API default.
         max_tokens: Maximum tokens to generate; required by the API.
         anthropic_version: Value sent as the anthropic-version header.
         headers: Extra headers to send.
@@ -41,7 +40,6 @@ class AsyncAnthropicProvider(AsyncProvider):
     api_key: str | None = None
     base_url: str = "https://api.anthropic.com/v1"
     timeout: float | None = 1200.0
-    temperature: float | None = 0.4
     max_tokens: int = 8192
     anthropic_version: str = _ANTHROPIC_VERSION
     headers: dict[str, str] = field(default_factory=dict)
@@ -68,7 +66,7 @@ class AsyncAnthropicProvider(AsyncProvider):
             The assistant message content.
         """
         prefill = "{" if response_format is not None else None
-        body = _build_body(self.model, messages, self.temperature, self.max_tokens, prefill, extra_body)
+        body = _build_body(self.model, messages, self.max_tokens, prefill, extra_body)
         url = f"{self.base_url.rstrip('/')}/messages"
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         if self.stream:
