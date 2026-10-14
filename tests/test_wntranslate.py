@@ -99,7 +99,9 @@ def test_generate_prompt_varies() -> None:
     assert "Do not maintain a running story summary" in generate_prompt(
         TranslationSettings(context_type=ContextType.NONE)
     )
-    assert "concise digest" in generate_prompt(TranslationSettings(context_type=ContextType.ROLLING_SUMMARY))
+    summary_prompt = generate_prompt(TranslationSettings(context_type=ContextType.ROLLING_SUMMARY))
+    assert "cumulative digest of the entire story" in summary_prompt
+    assert "BUILD ON IT" in summary_prompt
     assert "Notes are always provided" in generate_prompt(TranslationSettings(context_type=ContextType.NONE))
     assert "Notes are always provided" in generate_prompt(TranslationSettings())
 

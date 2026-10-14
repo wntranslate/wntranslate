@@ -139,10 +139,12 @@ def _glossary_rules(settings: TranslationSettings) -> str:
 def _summary_rule(settings: TranslationSettings) -> str | None:
     if settings.context_type is ContextType.ROLLING_SUMMARY:
         return (
-            "A running story summary is provided and may omit details. Keep continuity from it and return an updated "
-            "summary, but keep it COMPRESSED: rewrite and condense rather than appending — merge and generalize older "
-            "events, and drop stale, resolved, or fine-grained details no longer needed to translate later chapters. "
-            "It may grow as the story does, but prune so it stays a concise digest, never an ever-growing log."
+            "A running summary of the WHOLE story so far is provided. BUILD ON IT: fold the current chapter into it "
+            "and return the updated whole-story summary — never replace it with only the latest events, and never "
+            "drop the earlier story. Keep every still-relevant fact: main characters and who they are, relationships, "
+            "the setting/world, and ongoing or unresolved plot threads. Keep it readable by condensing, not deleting "
+            "— merge and generalize older, fully-resolved details rather than cutting context that still matters — so "
+            "it grows slowly as a cumulative digest of the entire story, not a log of just the recent chapters."
         )
     if settings.context_type is ContextType.NONE:
         return "Do not maintain a running story summary."
