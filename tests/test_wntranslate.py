@@ -457,6 +457,37 @@ def test_relink_backfills_all_chapters() -> None:
     assert wn.relink() == 0
 
 
+def test_loads_collapses_content_from_below_1_3_0() -> None:
+    wn = WebNovel("src", "")
+    person = PersonEntry(name="Iroha")
+    wn.glossary.add(person)
+    wn.chapters.append(
+        Chapter(
+            original_title="o",
+            original_content="c",
+            title="C1",
+            content=Content(nodes=[TextNode(text="Hi "), TermNode(term_id=person.id), TextNode(text=" there")]),
+        )
+    )
+    data = json.loads(wn.dumps())
+    data["version"] = "1.2.9"
+    migrated = WebNovel.from_dict(data)
+    nodes = migrated.chapters[0].content.nodes
+    assert len(nodes) == 1 and isinstance(nodes[0], TextNode)
+    assert nodes[0].text == "Hi Iroha there"
+
+
+def test_loads_keeps_term_nodes_at_1_3_0() -> None:
+    wn = WebNovel("src", "")
+    person = PersonEntry(name="Iroha")
+    wn.glossary.add(person)
+    wn.chapters.append(
+        Chapter(original_title="o", original_content="c", title="C1", content=Content(nodes=[TermNode(term_id=person.id)]))
+    )
+    migrated = WebNovel.from_dict(json.loads(wn.dumps()))
+    assert any(isinstance(n, TermNode) for n in migrated.chapters[0].content.nodes)
+
+
 def test_apply_glossary_delete() -> None:
     wn = WebNovel("src", "")
     person = PersonEntry(name="Lin")

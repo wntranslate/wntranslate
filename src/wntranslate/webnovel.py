@@ -11,9 +11,9 @@ from ._version import __version__
 from .chapter import Chapter
 from .content import Content, TermNode, TextNode
 from .context import Context
-from .enums import ContextType, GlossaryOp, RequestKind
+from .enums import GlossaryOp, RequestKind
 from .glossary import Glossary
-from .linker import link_content
+from .linker import collapse_content, link_content
 from .prompts import (
     generate_analysis_prompt,
     generate_chapter_prompt,
@@ -58,6 +58,17 @@ def _content_is_empty(content: Content) -> bool:
     return not any(
         (isinstance(node, TextNode) and node.text.strip()) or isinstance(node, TermNode) for node in content.nodes
     )
+
+
+def _version_below(version: str | None, target: tuple[int, int, int]) -> bool:
+    """Whether a save's version string is older than target; an absent or unparseable one counts as older."""
+    if not version:
+        return True
+    try:
+        parts = tuple(int(piece) for piece in version.split(".")[:3])
+    except ValueError:
+        return True
+    return parts + (0,) * (3 - len(parts)) < target
 
 
 def _cap_runs(text: str, limit: int) -> str:
@@ -323,9 +334,6 @@ class _BaseWebNovel:
         Returns:
             The reconstructed project.
         """
-        if data.get("version") != __version__:
-            # XXX: allow migrating old versions if old version dump output does not match
-            pass
         webnovel = cls(
             original_title=data.get("original_title", ""),
             original_synopsis=data.get("original_synopsis", ""),
@@ -337,6 +345,9 @@ class _BaseWebNovel:
         )
         if "context" in data:
             webnovel.context = Context.from_dict(data["context"])
+        if _version_below(data.get("version"), (1, 3, 0)):
+            for chapter in webnovel.chapters:
+                chapter.content = collapse_content(chapter.content, webnovel.glossary)
         return webnovel
 
     def dumps(self, **kwargs: Any) -> str:
@@ -388,10 +399,7 @@ class _BaseWebNovel:
         return cls.from_dict(json.load(fp))
 
     def _state(self) -> dict[str, Any]:
-        state: dict[str, Any] = {"glossary": self.glossary.to_dict(), "notes": self.context.notes}
-        if self.settings.context_type is ContextType.ROLLING_SUMMARY:
-            state["summary"] = self.context.summary
-        return state
+        return {"glossary": self.glossary.to_dict(include_definition=False), "notes": self.context.notes}
 
     def _overview(self) -> dict[str, Any]:
         recent = self.chapters[-_OVERVIEW_CHAPTERS:]
@@ -452,20 +460,26 @@ class _BaseWebNovel:
     def _analysis_user(self, original_title: str, original_content: str) -> str:
         return f"Analyze this new chapter.\n\nTitle:\n{self._cap(original_title)}\n\nContent:\n{self._cap(original_content)}"
 
-    def _draft_user(self, original_content: str) -> str:
+    def _draft_user(self, original_title: str, original_content: str) -> str:
         return (
-            "Now translate this chapter IN FULL, using the finalized glossary in the updated project state above. "
-            "Translate every paragraph from the first line to the last — never stop early, summarize, or omit any "
-            f"part of it.\n\nContent:\n{self._cap(original_content)}"
+            "Now translate THIS chapter in full from the source below — its title and every paragraph from the "
+            "first line to the last, using the finalized glossary in the project state above. Translate only this "
+            "source; never copy a neighbouring chapter. Never stop early, summarize, or omit any part of it.\n\n"
+            f"Title:\n{self._cap(original_title)}\n\nContent:\n{self._cap(original_content)}"
         )
 
     def _chapter_json(self, title: str, content: Content) -> str:
         return json.dumps({"title": title, "content": content.to_dict()}, ensure_ascii=False)
 
-    def _cleanup_user(self, draft: ChapterDraft) -> str:
+    def _cleanup_user(self, draft: ChapterDraft, original_title: str, original_content: str) -> str:
         return (
-            "Review this translation and return the ENTIRE corrected chapter — every node from start to finish, not "
-            "only the parts you change. Here is the chapter you produced:\n\n"
+            "Review this translation against the source below and return the ENTIRE corrected chapter — every node "
+            "from start to finish, not only the parts you change. The title and content must be a translation of "
+            "THIS source, never a copy of another chapter.\n\nSource title:\n"
+            + self._cap(original_title)
+            + "\n\nSource:\n"
+            + self._cap(original_content)
+            + "\n\nYour translation:\n"
             + self._chapter_json(draft.title, draft.content)
         )
 
@@ -683,6 +697,11 @@ class _BaseWebNovel:
             self.chapters.insert(payload.position, existing)
 
     def _resolve(self, item: DataRequest) -> DataResult:
+        if item.kind is RequestKind.STORY_SUMMARY:
+            return DataResult(request=item, found=True, value=self.context.summary)
+        if item.kind is RequestKind.GLOSSARY_ENTRY:
+            entry = self.glossary.get(item.glossary_id) if item.glossary_id else None
+            return DataResult(request=item, found=entry is not None, value=[entry.to_dict()] if entry else None)
         if item.kind is RequestKind.SYNOPSIS:
             return DataResult(request=item, found=True, value=self.synopsis)
         if item.kind is RequestKind.ORIGINAL_TITLE:
@@ -755,14 +774,16 @@ class WebNovel(_BaseWebNovel):
         self.provider = provider
 
     def translate_new_chapter(self, original_title: str, original_content: str) -> Chapter:
-        """Translate a new chapter in three model passes within one conversation and apply it.
+        """Translate a new chapter in three model passes, each its own chat, and apply it.
 
         Pass 1 stages glossary, notes, and running-summary updates plus the chapter's kind and
         summary; pass 2 produces the translation using that staged state; pass 3 reviews and
-        fixes it (and may correct pass-1 glossary or context mistakes). Glossary names are then
-        linked to their entries deterministically against the finalized glossary (no model pass).
-        Data requests in any pass are auto-fulfilled. Nothing is committed to the project until
-        every pass succeeds — on any failure the project is left unchanged.
+        fixes it (and may correct pass-1 glossary or context mistakes). Each pass is a fresh
+        conversation carrying only the finalized state and what that pass needs, so earlier
+        passes' output does not bloat later ones. Glossary names are then linked to their entries
+        deterministically against the finalized glossary (no model pass). Data requests in any
+        pass are auto-fulfilled. Nothing is committed to the project until every pass succeeds —
+        on any failure the project is left unchanged.
 
         Args:
             original_title: Source-language title.
@@ -776,8 +797,8 @@ class WebNovel(_BaseWebNovel):
         self.glossary = Glossary.from_dict(self.glossary.to_dict())
         self.context = Context.from_dict(self.context.to_dict())
         try:
-            conversation = self._chapter_system()
             analysis_schema = analysis_output_schema(self.settings)
+            conversation = self._chapter_system()
             conversation.append(Message(role="system", content=generate_analysis_prompt(self.settings)))
             conversation.append(_schema_message(analysis_schema))
             conversation.append(Message(role="user", content=self._analysis_user(original_title, original_content)))
@@ -785,18 +806,17 @@ class WebNovel(_BaseWebNovel):
             self._apply_analysis(analysis)
 
             draft_schema = draft_output_schema(self.settings)
-            conversation.append(
-                Message(role="system", content="Updated project state (JSON):\n" + json.dumps(self._state(), ensure_ascii=False))
-            )
+            conversation = self._chapter_system()
             conversation.append(Message(role="system", content=generate_translation_prompt(self.settings)))
             conversation.append(_schema_message(draft_schema))
-            conversation.append(Message(role="user", content=self._draft_user(original_content)))
+            conversation.append(Message(role="user", content=self._draft_user(original_title, original_content)))
             draft = self._ask(conversation, draft_schema, parse_draft)
 
             cleanup_schema = cleanup_output_schema(self.settings)
+            conversation = self._chapter_system()
             conversation.append(Message(role="system", content=generate_cleanup_prompt(self.settings)))
             conversation.append(_schema_message(cleanup_schema))
-            conversation.append(Message(role="user", content=self._cleanup_user(draft)))
+            conversation.append(Message(role="user", content=self._cleanup_user(draft, original_title, original_content)))
             cleanup = self._ask(conversation, cleanup_schema, parse_cleanup)
             self._apply_cleanup(cleanup)
 
@@ -943,14 +963,16 @@ class AsyncWebNovel(_BaseWebNovel):
         self.provider = provider
 
     async def translate_new_chapter(self, original_title: str, original_content: str) -> Chapter:
-        """Translate a new chapter in three model passes within one conversation and apply it.
+        """Translate a new chapter in three model passes, each its own chat, and apply it.
 
         Pass 1 stages glossary, notes, and running-summary updates plus the chapter's kind and
         summary; pass 2 produces the translation using that staged state; pass 3 reviews and
-        fixes it (and may correct pass-1 glossary or context mistakes). Glossary names are then
-        linked to their entries deterministically against the finalized glossary (no model pass).
-        Data requests in any pass are auto-fulfilled. Nothing is committed to the project until
-        every pass succeeds — on any failure the project is left unchanged.
+        fixes it (and may correct pass-1 glossary or context mistakes). Each pass is a fresh
+        conversation carrying only the finalized state and what that pass needs, so earlier
+        passes' output does not bloat later ones. Glossary names are then linked to their entries
+        deterministically against the finalized glossary (no model pass). Data requests in any
+        pass are auto-fulfilled. Nothing is committed to the project until every pass succeeds —
+        on any failure the project is left unchanged.
 
         Args:
             original_title: Source-language title.
@@ -964,8 +986,8 @@ class AsyncWebNovel(_BaseWebNovel):
         self.glossary = Glossary.from_dict(self.glossary.to_dict())
         self.context = Context.from_dict(self.context.to_dict())
         try:
-            conversation = self._chapter_system()
             analysis_schema = analysis_output_schema(self.settings)
+            conversation = self._chapter_system()
             conversation.append(Message(role="system", content=generate_analysis_prompt(self.settings)))
             conversation.append(_schema_message(analysis_schema))
             conversation.append(Message(role="user", content=self._analysis_user(original_title, original_content)))
@@ -973,18 +995,17 @@ class AsyncWebNovel(_BaseWebNovel):
             self._apply_analysis(analysis)
 
             draft_schema = draft_output_schema(self.settings)
-            conversation.append(
-                Message(role="system", content="Updated project state (JSON):\n" + json.dumps(self._state(), ensure_ascii=False))
-            )
+            conversation = self._chapter_system()
             conversation.append(Message(role="system", content=generate_translation_prompt(self.settings)))
             conversation.append(_schema_message(draft_schema))
-            conversation.append(Message(role="user", content=self._draft_user(original_content)))
+            conversation.append(Message(role="user", content=self._draft_user(original_title, original_content)))
             draft = await self._ask(conversation, draft_schema, parse_draft)
 
             cleanup_schema = cleanup_output_schema(self.settings)
+            conversation = self._chapter_system()
             conversation.append(Message(role="system", content=generate_cleanup_prompt(self.settings)))
             conversation.append(_schema_message(cleanup_schema))
-            conversation.append(Message(role="user", content=self._cleanup_user(draft)))
+            conversation.append(Message(role="user", content=self._cleanup_user(draft, original_title, original_content)))
             cleanup = await self._ask(conversation, cleanup_schema, parse_cleanup)
             self._apply_cleanup(cleanup)
 

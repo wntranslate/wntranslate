@@ -44,6 +44,8 @@ class RequestKind(Enum):
     CHAPTER_TEXT = "chapter_text"
     CHAPTER_ORIGINAL_TITLE = "chapter_original_title"
     CHAPTER_ORIGINAL_CONTENT = "chapter_original_content"
+    GLOSSARY_ENTRY = "glossary_entry"
+    STORY_SUMMARY = "story_summary"
     OTHER = "other"
 
 

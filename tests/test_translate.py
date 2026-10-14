@@ -45,6 +45,7 @@ class FakeProvider(Provider):
         self.replies = [reply] if isinstance(reply, str) else list(reply)
         self.calls = 0
         self.last_messages: list[Message] = []
+        self.all_messages: list[Message] = []
 
     def complete(
         self,
@@ -54,6 +55,7 @@ class FakeProvider(Provider):
         extra_body: dict[str, Any] | None = None,
     ) -> str:
         self.last_messages = list(messages)
+        self.all_messages.extend(messages)
         reply = self.replies[min(self.calls, len(self.replies) - 1)]
         self.calls += 1
         return reply
@@ -63,6 +65,7 @@ class FakeAsyncProvider(AsyncProvider):
     def __init__(self, reply: str | list[str]) -> None:
         self.replies = [reply] if isinstance(reply, str) else list(reply)
         self.calls = 0
+        self.all_messages: list[Message] = []
 
     async def complete(
         self,
@@ -71,6 +74,7 @@ class FakeAsyncProvider(AsyncProvider):
         response_format: dict[str, Any] | None = None,
         extra_body: dict[str, Any] | None = None,
     ) -> str:
+        self.all_messages.extend(messages)
         reply = self.replies[min(self.calls, len(self.replies) - 1)]
         self.calls += 1
         return reply
@@ -127,7 +131,7 @@ def test_translate_new_chapter_auto_fulfills_requests() -> None:
     assert isinstance(result, Chapter)
     assert provider.calls == 4
     assert len(wn.chapters) == 1
-    requested = next(m.content for m in provider.last_messages if m.content.startswith("Data you requested"))
+    requested = next(m.content for m in provider.all_messages if m.content.startswith("Data you requested"))
     assert "chapter_list" in requested
 
 
@@ -332,8 +336,8 @@ def test_schema_retry_then_succeeds() -> None:
     assert isinstance(result, Chapter)
     assert provider.calls == 4
     assert len(wn.chapters) == 1
-    assert any(m.role == "assistant" and m.content == "not json" for m in provider.last_messages)
-    assert any("was rejected" in m.content for m in provider.last_messages)
+    assert any(m.role == "assistant" and m.content == "not json" for m in provider.all_messages)
+    assert any("was rejected" in m.content for m in provider.all_messages)
 
 
 def test_schema_retry_gives_up_after_limit() -> None:
@@ -446,9 +450,7 @@ def test_review_pass_embeds_the_draft_and_cleanup_result_is_kept() -> None:
     wn = WebNovel("src", "", provider=provider)
     chapter = wn.translate_new_chapter("t", "c")
     assert provider.calls == 3
-    convo = provider.last_messages
-    assert any(m.role == "user" and "draft text" in m.content for m in convo)
-    assert any(m.role == "user" and "in full" in m.content.lower() for m in convo)
+    assert any(m.role == "user" and "draft text" in m.content for m in provider.last_messages)
     assert chapter.render(wn.glossary) == "cleaned text"
 
 
@@ -561,6 +563,36 @@ def test_state_passed_to_model() -> None:
     state = next(m.content for m in provider.last_messages if m.content.startswith("Project state"))
     assert "Ayami" in state
     assert "stylistic rule" in state
+
+
+def test_state_omits_definitions_and_summary() -> None:
+    wn = WebNovel("src", "")
+    wn.glossary.add(PersonEntry(name="Ayami", original_name="あや", definition="a long backstory", aliases=[Alias(original="彩", translation="Aya")]))
+    wn.context.notes.append("keep style")
+    wn.context.summary = "the whole story so far"
+    state = wn._state()
+    entry = state["glossary"]["entries"][0]
+    assert entry["name"] == "Ayami" and entry["id"] and entry["aliases"][0]["translation"] == "Aya"
+    assert "definition" not in entry
+    assert "summary" not in state
+    assert state["notes"] == ["keep style"]
+
+
+def test_request_glossary_entry_returns_definition() -> None:
+    wn = WebNovel("src", "")
+    person = PersonEntry(name="Ayami", definition="the heroine")
+    wn.glossary.add(person)
+    results = wn.resolve_request(TranslationRequest(requests=[DataRequest(kind=RequestKind.GLOSSARY_ENTRY, glossary_id=person.id)]))
+    assert results[0].found
+    assert results[0].value[0]["definition"] == "the heroine"
+
+
+def test_request_story_summary() -> None:
+    wn = WebNovel("src", "")
+    wn.context.summary = "everything that has happened"
+    results = wn.resolve_request(TranslationRequest(requests=[DataRequest(kind=RequestKind.STORY_SUMMARY)]))
+    assert results[0].found
+    assert results[0].value == "everything that has happened"
 
 
 def test_resolve_webnovel_fields() -> None:

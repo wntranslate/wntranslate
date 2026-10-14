@@ -90,6 +90,32 @@ def _merge_adjacent_text(nodes: list[Node]) -> list[Node]:
     return merged
 
 
+def collapse_content(content: Content, glossary: Glossary) -> Content:
+    """Flatten content to prose, resolving each term node to its text and merging runs.
+
+    Used to migrate older saves whose term nodes were built by the model: the links are discarded
+    (a dangling one drops to nothing) and the text is merged into as few text nodes as possible,
+    leaving footnote nodes in place. Deterministic linking can then re-derive links from the text.
+
+    Args:
+        content: The content to flatten.
+        glossary: The glossary used to resolve term nodes.
+
+    Returns:
+        A new Content with no term nodes.
+    """
+    nodes: list[Node] = []
+    for node in content.nodes:
+        if isinstance(node, TermNode):
+            try:
+                nodes.append(TextNode(node.resolve(glossary)))
+            except KeyError:
+                continue
+        else:
+            nodes.append(node)
+    return Content(nodes=_merge_adjacent_text(nodes))
+
+
 def link_content(content: Content, glossary: Glossary) -> Content:
     """Deterministically link glossary names in a chapter's text to term nodes.
 

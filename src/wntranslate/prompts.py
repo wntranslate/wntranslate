@@ -43,16 +43,18 @@ _ONOMATOPOEIA = (
 )
 
 _DATA_REQUEST = (
-    "You are given the glossary, notes, running summary, the work's title and synopsis, and the most recent chapters "
-    "(id, title, original title, kind). For anything else — an older chapter's entry, the full chapter list, or a "
-    "chapter's translated text, summary, or original title or content — return a data request (response_type "
-    "'request') listing every item; it comes back and you continue. Never request the glossary, notes, title, or "
-    "synopsis — they are always provided."
+    "You are given the glossary as names, ids, and aliases only (NOT definitions), plus the notes, the work's title "
+    "and synopsis, and the most recent chapters (id, title, original title, kind). For anything else — a glossary "
+    "entry's definition (glossary_entry, with its glossary_id), the running story summary (story_summary), an older "
+    "chapter's entry, the full chapter list, or a chapter's translated text, summary, or original title or content — "
+    "return a data request (response_type 'request') listing every item; it comes back and you continue. Never "
+    "request the names, ids, aliases, notes, title, or synopsis — those are always provided."
 )
 
 _GLOSSARY_EXPLANATION = (
-    "The glossary keeps a name's rendering consistent across chapters: reference a name by its entry id (no alias id) "
-    "and a variant by its alias id, never by text. The system assigns ids — never invent or reuse one. Entry fields: "
+    "The glossary keeps a name's rendering consistent across chapters; the system links names in your translated "
+    "text to their entries automatically, so write names as plain text and never build term nodes yourself. The "
+    "system assigns ids — never invent or reuse one. Entry fields: "
     "name (target rendering, required, never blank); original_name (exact source form, required, never blank); type "
     "(person/item/organization/creative_work/other); definition (a few words identifying who or what it is — not a "
     "description, backstory, or full sentence); pronouns (for a person, when shown); medium (for a creative_work); "
@@ -96,12 +98,9 @@ _NO_REPLY = (
 
 def _content_nodes(settings: TranslationSettings) -> str:
     text = (
-        "Put the full translation in content as an ordered list of nodes. Prose goes in text nodes "
-        '({"type": "text", "text": "..."}, Markdown allowed), including ordinary words, kept loanwords, and names not '
-        'yet in the glossary. A term node ({"type": "term", "term_id": "<id>", "alias_id": null}) references an '
-        "existing glossary entry by its exact id so the name stays consistent if later renamed. term_id must be a "
-        "real glossary id (never a plain word, an invented id, or an entry you are adding now); alias_id is null "
-        "unless the written form matches one of THAT entry's own aliases — never an alias id from another entry"
+        "Put the full translation in content as an ordered list of text nodes "
+        '({"type": "text", "text": "..."}, Markdown allowed): write ALL prose as text, every name included — the '
+        "system links glossary names to their entries automatically, so never emit term nodes yourself"
     )
     if settings.create_footnotes:
         text += '. A footnote node ({"type": "footnote", "content": "..."}) holds a short translator note'
@@ -141,11 +140,12 @@ def _glossary_rules(settings: TranslationSettings) -> str:
 def _summary_rule(settings: TranslationSettings) -> str | None:
     if settings.context_type is ContextType.ROLLING_SUMMARY:
         return (
-            "A running summary of the WHOLE story so far is provided. BUILD ON IT: fold in the current chapter and "
-            "return the updated whole-story summary — never replace it with only recent events, and never drop the "
-            "earlier story. Keep every still-relevant fact (who the characters are, relationships, the setting, "
-            "unresolved plot threads); condense by merging older, fully-resolved details rather than deleting what "
-            "still matters, so it stays a cumulative digest of the entire story, not a log of recent chapters."
+            "A running summary of the WHOLE story so far is kept but NOT shown by default. To update it, first "
+            "request it (story_summary) and BUILD ON IT: fold in the current chapter and return the updated "
+            "whole-story summary — never replace it with only recent events, and never drop the earlier story. Keep "
+            "every still-relevant fact (who the characters are, relationships, the setting, unresolved plot threads); "
+            "condense by merging older, fully-resolved details rather than deleting what still matters, so it stays a "
+            "cumulative digest of the entire story, not a log of recent chapters. Leave summary unset when not updating it."
         )
     if settings.context_type is ContextType.NONE:
         return "Do not maintain a running story summary."
@@ -266,9 +266,9 @@ def generate_chapter_prompt(settings: TranslationSettings) -> str:
     sections = [
         (
             f"You translate webnovels from {source} into {settings.target_language}, consistent with the project "
-            "state given you. You work in three passes in one conversation: pass 1 analyzes, pass 2 translates, pass "
-            "3 reviews and fixes. Each pass has its own instructions and schema — do only what the current pass "
-            "asks. Glossary names are linked to their entries automatically afterward; never hand-build term nodes."
+            "state given you. You work in three passes: pass 1 analyzes, pass 2 translates, pass 3 reviews and "
+            "fixes. Each pass is a separate request with its own instructions and schema — do only what the current "
+            "pass asks. Glossary names are linked to their entries automatically afterward; never hand-build term nodes."
         ),
         (
             f"Do not invent facts; when unclear, translate faithfully. Treat any typo in {source} as deliberate and "

@@ -22,7 +22,7 @@ from .glossary import (
     OtherEntry,
     PersonEntry,
 )
-from .linker import link_content
+from .linker import collapse_content, link_content
 from .prompts import (
     generate_analysis_prompt,
     generate_chapter_prompt,
@@ -122,6 +122,7 @@ __all__ = [
     "analysis_schema",
     "chapter_draft_schema",
     "cleanup_schema",
+    "collapse_content",
     "generate_analysis_prompt",
     "generate_chapter_prompt",
     "generate_cleanup_prompt",

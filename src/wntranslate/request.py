@@ -13,6 +13,7 @@ class DataRequest:
     Args:
         kind: What kind of data is requested.
         chapter_id: Target chapter id, when the request concerns one chapter.
+        glossary_id: Target glossary entry id, when the request concerns one entry.
         start: Start index for a partial chapter list, or None.
         end: End index (exclusive) for a partial chapter list, or None.
         detail: Optional free-form description of the request.
@@ -20,6 +21,7 @@ class DataRequest:
 
     kind: RequestKind
     chapter_id: str | None = None
+    glossary_id: str | None = None
     start: int | None = None
     end: int | None = None
     detail: str | None = None
@@ -33,6 +35,7 @@ class DataRequest:
         return {
             "kind": self.kind.value,
             "chapter_id": self.chapter_id,
+            "glossary_id": self.glossary_id,
             "start": self.start,
             "end": self.end,
             "detail": self.detail,
@@ -51,6 +54,7 @@ class DataRequest:
         return cls(
             kind=RequestKind(data["kind"]),
             chapter_id=data.get("chapter_id"),
+            glossary_id=data.get("glossary_id"),
             start=data.get("start"),
             end=data.get("end"),
             detail=data.get("detail"),
@@ -143,6 +147,7 @@ def request_schema() -> dict[str, Any]:
                     "properties": {
                         "kind": {"type": "string", "enum": [kind.value for kind in RequestKind]},
                         "chapter_id": {"type": ["string", "null"]},
+                        "glossary_id": {"type": ["string", "null"]},
                         "start": {"type": ["integer", "null"]},
                         "end": {"type": ["integer", "null"]},
                         "detail": {"type": ["string", "null"]},

@@ -90,15 +90,18 @@ class GlossaryEntry:
                 return alias
         return None
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, include_definition: bool = True) -> dict[str, Any]:
         """Serialize to a plain dict including id and name type.
+
+        Args:
+            include_definition: When False, omit the definition (the model fetches it on request).
 
         Returns:
             A JSON-compatible representation.
         """
         data: dict[str, Any] = {"id": self._id, "type": self.type.value}
         for f in fields(self):
-            if f.name == "_id":
+            if f.name == "_id" or (f.name == "definition" and not include_definition):
                 continue
             if f.name == "aliases":
                 data["aliases"] = [alias.to_dict() for alias in self.aliases]
@@ -276,13 +279,16 @@ class Glossary:
                 return entry
         return None
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, include_definition: bool = True) -> dict[str, Any]:
         """Serialize to a plain dict.
+
+        Args:
+            include_definition: When False, omit each entry's definition.
 
         Returns:
             A JSON-compatible representation.
         """
-        return {"entries": [entry.to_dict() for entry in self.entries]}
+        return {"entries": [entry.to_dict(include_definition=include_definition) for entry in self.entries]}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Glossary:
