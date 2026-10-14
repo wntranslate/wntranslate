@@ -7,7 +7,7 @@ Tested with local llama.cpp self-hosted Qwen3.6 35B A3B model, Deepseek V4.1 Fla
 A high parameter model is recommended to understand the prompt and properly apply translations. This library uses a four-pass system (analyze, translate, review, apply glossary) every single translation, and thinking mode is recommended to be OFF (`ReasoningEffort.NONE`) or LOW (`ReasoningEffort.LOW`), otherwise each chapter will take a lot of time.
 
 Testing chapter length averages ~2000 Japanese characters, on official APIs.
-- Deepseek V4.1 Flash: Under 60s on average per chapter, costing under $0.03 per chapter.
+- Deepseek V4.1 Flash: Under 60s on average per chapter, costing under $0.05 per chapter.
 - Claude Haiku 5.5: Under 60s on average per chapter, costing under $0.5 per chapter
 
 For cheaper translations, Deepseek V4.1 Flash (`deepseek-flash`) is recommended. Claude Haiku 5.5 is not recommended (fails to follow instructions commonly) and is extremely expensive.
