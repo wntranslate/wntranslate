@@ -13,11 +13,11 @@ from .content import Content, TermNode, TextNode
 from .context import Context
 from .enums import ContextType, GlossaryOp, RequestKind
 from .glossary import Glossary
+from .linker import link_content
 from .prompts import (
     generate_analysis_prompt,
     generate_chapter_prompt,
     generate_cleanup_prompt,
-    generate_linking_prompt,
     generate_metadata_prompt,
     generate_translation_prompt,
 )
@@ -226,6 +226,24 @@ class _BaseWebNovel:
                 self.context.summary = response.context.summary
             if response.context.notes is not None:
                 self.context.notes = list(response.context.notes)
+
+    def relink(self) -> int:
+        """Re-link every chapter's text to glossary entries, deterministically.
+
+        Useful after the glossary grows (names introduced in later chapters are back-linked into
+        earlier ones) or after a bulk glossary repair. Only unlinked text is affected; existing
+        term and footnote nodes are left as they are.
+
+        Returns:
+            The number of chapters whose content changed.
+        """
+        changed = 0
+        for chapter in self.chapters:
+            linked = link_content(chapter.content, self.glossary)
+            if linked is not chapter.content:
+                chapter.content = linked
+                changed += 1
+        return changed
 
     def resolve_request(self, request: TranslationRequest) -> list[DataResult]:
         """Resolve each item of a data request against this project.
@@ -451,13 +469,6 @@ class _BaseWebNovel:
             + self._chapter_json(draft.title, draft.content)
         )
 
-    def _linking_user(self, cleanup: ChapterCleanup) -> str:
-        return (
-            "Link the glossary names in this chapter and return it IN FULL — every node from start to finish, "
-            "changing nothing else. Here is the chapter:\n\n"
-            + self._chapter_json(cleanup.title, cleanup.content)
-        )
-
     def _apply_glossary_and_context(self, glossary_updates: list[GlossaryUpdate], context: ContextUpdate | None) -> None:
         for update in glossary_updates:
             self._apply_glossary_update(update)
@@ -483,6 +494,7 @@ class _BaseWebNovel:
         self, draft: ChapterDraft, original_title: str, original_content: str, analysis: ChapterAnalysis
     ) -> Chapter:
         chapter = draft.to_chapter(original_title, original_content, analysis.kind, analysis.summary)
+        chapter.content = link_content(chapter.content, self.glossary)
         if draft.position is None:
             self.chapters.append(chapter)
         else:
@@ -644,9 +656,6 @@ class _BaseWebNovel:
                 return
             existing = self.glossary.get(update.target_id)
             if existing is not None:
-                # An edit is a partial update: merge the sent fields onto the existing entry so an
-                # edit that omits name/original_name (e.g. just revising the definition) can never
-                # blank them. Replacing wholesale with to_entry would wipe every omitted field.
                 self.glossary.replace(update.target_id, update.merged_entry(existing))
         else:
             self.glossary.add(update.to_entry())
@@ -655,6 +664,7 @@ class _BaseWebNovel:
         existing = next((c for c in self.chapters if c.id == payload.target_id), None) if payload.target_id else None
         if existing is None:
             chapter = payload.to_chapter(original_title, original_content)
+            chapter.content = link_content(chapter.content, self.glossary)
             if payload.position is None:
                 self.chapters.append(chapter)
             else:
@@ -663,7 +673,7 @@ class _BaseWebNovel:
         if payload.title:
             existing.title = payload.title
         if payload.content is not None and not _content_is_empty(payload.content):
-            existing.content = payload.content
+            existing.content = link_content(payload.content, self.glossary)
         if payload.kind is not None:
             existing.kind = payload.kind
         if payload.summary is not None:
@@ -745,14 +755,14 @@ class WebNovel(_BaseWebNovel):
         self.provider = provider
 
     def translate_new_chapter(self, original_title: str, original_content: str) -> Chapter:
-        """Translate a new chapter in four passes within one conversation and apply it.
+        """Translate a new chapter in three model passes within one conversation and apply it.
 
         Pass 1 stages glossary, notes, and running-summary updates plus the chapter's kind and
         summary; pass 2 produces the translation using that staged state; pass 3 reviews and
-        fixes it (and may correct pass-1 glossary or context mistakes); pass 4 links glossary
-        names in the content to their entries by id. Data requests in any pass are
-        auto-fulfilled. Nothing is committed to the project until every pass succeeds — on any
-        failure the project is left unchanged.
+        fixes it (and may correct pass-1 glossary or context mistakes). Glossary names are then
+        linked to their entries deterministically against the finalized glossary (no model pass).
+        Data requests in any pass are auto-fulfilled. Nothing is committed to the project until
+        every pass succeeds — on any failure the project is left unchanged.
 
         Args:
             original_title: Source-language title.
@@ -790,15 +800,8 @@ class WebNovel(_BaseWebNovel):
             cleanup = self._ask(conversation, cleanup_schema, parse_cleanup)
             self._apply_cleanup(cleanup)
 
-            conversation.append(
-                Message(role="system", content="Updated project state (JSON):\n" + json.dumps(self._state(), ensure_ascii=False))
-            )
-            conversation.append(Message(role="system", content=generate_linking_prompt(self.settings)))
-            conversation.append(_schema_message(draft_schema))
-            conversation.append(Message(role="user", content=self._linking_user(cleanup)))
-            linked = self._ask(conversation, draft_schema, parse_draft)
-
-            chapter = self._apply_draft(linked, original_title, original_content, analysis)
+            final = ChapterDraft(title=cleanup.title, content=cleanup.content, position=cleanup.position)
+            chapter = self._apply_draft(final, original_title, original_content, analysis)
             committed = True
             return chapter
         finally:
@@ -940,14 +943,14 @@ class AsyncWebNovel(_BaseWebNovel):
         self.provider = provider
 
     async def translate_new_chapter(self, original_title: str, original_content: str) -> Chapter:
-        """Translate a new chapter in four passes within one conversation and apply it.
+        """Translate a new chapter in three model passes within one conversation and apply it.
 
         Pass 1 stages glossary, notes, and running-summary updates plus the chapter's kind and
         summary; pass 2 produces the translation using that staged state; pass 3 reviews and
-        fixes it (and may correct pass-1 glossary or context mistakes); pass 4 links glossary
-        names in the content to their entries by id. Data requests in any pass are
-        auto-fulfilled. Nothing is committed to the project until every pass succeeds — on any
-        failure the project is left unchanged.
+        fixes it (and may correct pass-1 glossary or context mistakes). Glossary names are then
+        linked to their entries deterministically against the finalized glossary (no model pass).
+        Data requests in any pass are auto-fulfilled. Nothing is committed to the project until
+        every pass succeeds — on any failure the project is left unchanged.
 
         Args:
             original_title: Source-language title.
@@ -985,15 +988,8 @@ class AsyncWebNovel(_BaseWebNovel):
             cleanup = await self._ask(conversation, cleanup_schema, parse_cleanup)
             self._apply_cleanup(cleanup)
 
-            conversation.append(
-                Message(role="system", content="Updated project state (JSON):\n" + json.dumps(self._state(), ensure_ascii=False))
-            )
-            conversation.append(Message(role="system", content=generate_linking_prompt(self.settings)))
-            conversation.append(_schema_message(draft_schema))
-            conversation.append(Message(role="user", content=self._linking_user(cleanup)))
-            linked = await self._ask(conversation, draft_schema, parse_draft)
-
-            chapter = self._apply_draft(linked, original_title, original_content, analysis)
+            final = ChapterDraft(title=cleanup.title, content=cleanup.content, position=cleanup.position)
+            chapter = self._apply_draft(final, original_title, original_content, analysis)
             committed = True
             return chapter
         finally:

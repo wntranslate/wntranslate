@@ -250,11 +250,10 @@ def generate_prompt(settings: TranslationSettings) -> str:
 
 
 def generate_chapter_prompt(settings: TranslationSettings) -> str:
-    """Build the shared base system prompt for the four-pass new-chapter flow.
+    """Build the shared base system prompt for the multi-pass new-chapter flow.
 
     This carries only guidance common to every pass; per-pass instructions come from
-    generate_analysis_prompt, generate_translation_prompt, generate_cleanup_prompt, and
-    generate_linking_prompt.
+    generate_analysis_prompt, generate_translation_prompt, and generate_cleanup_prompt.
 
     Args:
         settings: The settings that shape the prompt.
@@ -267,9 +266,9 @@ def generate_chapter_prompt(settings: TranslationSettings) -> str:
     sections = [
         (
             f"You translate webnovels from {source} into {settings.target_language}, consistent with the project "
-            "state given you. You work in four passes in one conversation: pass 1 analyzes, pass 2 translates, pass "
-            "3 reviews and fixes, pass 4 links glossary names. Each pass has its own instructions and schema — do "
-            "only what the current pass asks."
+            "state given you. You work in three passes in one conversation: pass 1 analyzes, pass 2 translates, pass "
+            "3 reviews and fixes. Each pass has its own instructions and schema — do only what the current pass "
+            "asks. Glossary names are linked to their entries automatically afterward; never hand-build term nodes."
         ),
         (
             f"Do not invent facts; when unclear, translate faithfully. Treat any typo in {source} as deliberate and "
@@ -386,33 +385,4 @@ def generate_cleanup_prompt(settings: TranslationSettings) -> str:
             "empty and context null when nothing needs fixing."
         )
     sections.append("Return one JSON object matching the schema: a data request or the corrected chapter, never both.")
-    return "\n\n".join(sections)
-
-
-def generate_linking_prompt(settings: TranslationSettings) -> str:
-    """Build the pass 4 (glossary linking) instructions.
-
-    Args:
-        settings: The settings that shape the prompt.
-
-    Returns:
-        The assembled prompt.
-    """
-    sections = [
-        (
-            "Pass 4 of 4 — glossary linking. Return the same chapter with its glossary names linked. Change ONLY how "
-            "names are represented — keep all wording, punctuation, line breaks, the title, and every other node "
-            "exactly as they were."
-        ),
-        _COMPLETENESS,
-        _content_nodes(settings),
-        (
-            "Wherever a name that HAS a glossary entry appears as plain text, replace just that text with a term node "
-            "for that entry. Set alias_id only when the written form matches one of THAT entry's own aliases (an "
-            "alias id listed under that term_id) — never one from another entry. Leave ordinary words, kept "
-            "loanwords, and names with no entry as text. term_id and alias_id are copied verbatim from the glossary, "
-            "never invented."
-        ),
-        "Return one JSON object matching the schema: a data request or the linked chapter, never both.",
-    ]
     return "\n\n".join(sections)

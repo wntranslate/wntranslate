@@ -22,11 +22,11 @@ from .glossary import (
     OtherEntry,
     PersonEntry,
 )
+from .linker import link_content
 from .prompts import (
     generate_analysis_prompt,
     generate_chapter_prompt,
     generate_cleanup_prompt,
-    generate_linking_prompt,
     generate_metadata_prompt,
     generate_prompt,
     generate_translation_prompt,
@@ -125,11 +125,11 @@ __all__ = [
     "generate_analysis_prompt",
     "generate_chapter_prompt",
     "generate_cleanup_prompt",
-    "generate_linking_prompt",
     "generate_metadata_prompt",
     "generate_prompt",
     "generate_translation_prompt",
     "json_schema_format",
+    "link_content",
     "metadata_schema",
     "node_from_dict",
     "output_schema",

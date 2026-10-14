@@ -110,7 +110,7 @@ def test_translate_new_chapter_applies() -> None:
     wn = WebNovel("src", "", provider=provider)
     result = wn.translate_new_chapter("原題", "原文")
     assert isinstance(result, Chapter)
-    assert provider.calls == 4
+    assert provider.calls == 3
     assert len(wn.chapters) == 1
     assert wn.chapters[0].title == "Ch1"
     assert wn.chapters[0].original_title == "原題"
@@ -125,7 +125,7 @@ def test_translate_new_chapter_auto_fulfills_requests() -> None:
     wn = WebNovel("src", "", provider=provider)
     result = wn.translate_new_chapter("t", "c")
     assert isinstance(result, Chapter)
-    assert provider.calls == 5
+    assert provider.calls == 4
     assert len(wn.chapters) == 1
     requested = next(m.content for m in provider.last_messages if m.content.startswith("Data you requested"))
     assert "chapter_list" in requested
@@ -330,7 +330,7 @@ def test_schema_retry_then_succeeds() -> None:
     wn = WebNovel("src", "", provider=provider)
     result = wn.translate_new_chapter("t", "c")
     assert isinstance(result, Chapter)
-    assert provider.calls == 5
+    assert provider.calls == 4
     assert len(wn.chapters) == 1
     assert any(m.role == "assistant" and m.content == "not json" for m in provider.last_messages)
     assert any("was rejected" in m.content for m in provider.last_messages)
@@ -440,15 +440,16 @@ def test_empty_draft_is_rejected() -> None:
         wn.translate_new_chapter("t", "c")
 
 
-def test_review_and_linking_embed_the_chapter() -> None:
+def test_review_pass_embeds_the_draft_and_cleanup_result_is_kept() -> None:
     cleanup = ChapterCleanup(title="Ch1", content=Content(nodes=[TextNode(text="cleaned text")]))
-    provider = FakeProvider([_analysis(), _draft(text="draft text"), json.dumps(cleanup.to_dict()), _draft()])
+    provider = FakeProvider([_analysis(), _draft(text="draft text"), json.dumps(cleanup.to_dict())])
     wn = WebNovel("src", "", provider=provider)
-    wn.translate_new_chapter("t", "c")
-    convo = provider.last_messages  # the pass-4 (linking) conversation
-    assert any(m.role == "user" and "draft text" in m.content for m in convo)  # cleanup pass got the draft to review
-    assert any(m.role == "user" and "cleaned text" in m.content for m in convo)  # linking pass got the cleaned chapter
+    chapter = wn.translate_new_chapter("t", "c")
+    assert provider.calls == 3
+    convo = provider.last_messages
+    assert any(m.role == "user" and "draft text" in m.content for m in convo)
     assert any(m.role == "user" and "in full" in m.content.lower() for m in convo)
+    assert chapter.render(wn.glossary) == "cleaned text"
 
 
 def test_cleanup_pass_can_fix_glossary_and_context() -> None:
@@ -458,24 +459,23 @@ def test_cleanup_pass_can_fix_glossary_and_context() -> None:
         glossary_updates=[GlossaryUpdate(op=GlossaryOp.NEW, name="Iroha", original_name="イロハ", type=NameType.PERSON)],
         context=ContextUpdate(notes=["keep X"]),
     )
-    provider = FakeProvider([_analysis(), _draft(), _dump(cleanup), _draft()])
+    provider = FakeProvider([_analysis(), _draft(), _dump(cleanup)])
     wn = WebNovel("src", "", provider=provider)
     wn.translate_new_chapter("t", "c")
-    assert provider.calls == 4
+    assert provider.calls == 3
     assert len(wn.glossary) == 1
     assert wn.context.notes == ["keep X"]
     assert len(wn.chapters) == 1
 
 
-def test_fourth_pass_links_glossary_terms() -> None:
+def test_glossary_terms_are_linked_deterministically() -> None:
     wn = WebNovel("src", "")
     person = PersonEntry(name="Iroha")
     wn.glossary.add(person)
-    linked = ChapterDraft(title="Ch1", content=Content(nodes=[TextNode(text="Hi "), TermNode(term_id=person.id)]))
-    provider = FakeProvider([_analysis(), _draft(), _draft(), _dump(linked)])
+    provider = FakeProvider([_analysis(), _draft(text="Hi Iroha"), _draft(text="Hi Iroha")])
     wn.provider = provider
     chapter = wn.translate_new_chapter("t", "c")
-    assert provider.calls == 4
+    assert provider.calls == 3
     assert any(isinstance(node, TermNode) and node.term_id == person.id for node in chapter.content.nodes)
     assert chapter.render(wn.glossary) == "Hi Iroha"
 
@@ -582,13 +582,13 @@ def test_async_webnovel_translate_and_auto_fulfill() -> None:
     wn = AsyncWebNovel("src", "", provider=provider)
     result = asyncio.run(wn.translate_new_chapter("t", "c"))
     assert isinstance(result, Chapter)
-    assert provider.calls == 5
+    assert provider.calls == 4
     assert len(wn.chapters) == 1
     assert wn.chapters[0].original_title == "t"
 
 
 def test_settings_change_applies_next_translation() -> None:
-    provider = FakeProvider([_analysis(), _draft(), _draft(), _draft(), _analysis(), _draft(), _draft(), _draft()])
+    provider = FakeProvider([_analysis(), _draft(), _draft(), _analysis(), _draft(), _draft()])
     wn = WebNovel("src", "", provider=provider)
 
     wn.settings.creativity = Creativity.VERY_LOW

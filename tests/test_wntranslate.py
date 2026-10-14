@@ -18,6 +18,8 @@ from wntranslate import (
     GlossaryOp,
     GlossaryUpdate,
     NameType,
+    OrganizationEntry,
+    OtherEntry,
     PersonEntry,
     RequestKind,
     ResponseType,
@@ -28,9 +30,9 @@ from wntranslate import (
     TranslationSettings,
     WebNovel,
     generate_analysis_prompt,
-    generate_linking_prompt,
     generate_prompt,
     generate_translation_prompt,
+    link_content,
     metadata_schema,
     output_schema,
     parse_model_output,
@@ -92,7 +94,6 @@ def test_generate_prompt_varies() -> None:
     assert "footnotes only" in generate_prompt(TranslationSettings())
     assert "runaway" in generate_prompt(TranslationSettings())
     assert "translate the chapter's title" in generate_translation_prompt(TranslationSettings()).lower()
-    assert "translate the chapter's title" in generate_linking_prompt(TranslationSettings()).lower()
     assert "Do not produce footnotes" in generate_prompt(TranslationSettings(create_footnotes=False))
     assert "Do not produce chapter summaries" in generate_prompt(
         TranslationSettings(generate_chapter_summaries=False)
@@ -355,8 +356,6 @@ def test_apply_glossary_edit_preserves_ids() -> None:
 
 
 def test_apply_glossary_edit_partial_keeps_omitted_fields() -> None:
-    # Regression: an edit that sends only a changed field (the model's natural behavior) must not
-    # wipe the name/original_name/pronouns it omitted. Parsed via from_dict to exercise the real path.
     wn = WebNovel("src", "")
     person = PersonEntry(
         name="Mai",
@@ -397,6 +396,65 @@ def test_glossary_edit_blanking_name_rejected() -> None:
     update = GlossaryUpdate.from_dict({"op": "edit", "target_id": person.id, "name": ""})
     with pytest.raises(TranslationError, match="blank the name"):
         wn._check_glossary_policy([update])
+
+
+def test_link_content_links_name_and_alias() -> None:
+    glossary = Glossary(
+        entries=[PersonEntry(name="Iroha", aliases=[Alias(original="マイちゃん", translation="Mai-chan")])]
+    )
+    entry = glossary.entries[0]
+    content = Content(nodes=[TextNode(text="Hi Iroha and Mai-chan!")])
+    linked = link_content(content, glossary)
+    terms = [n for n in linked.nodes if isinstance(n, TermNode)]
+    assert [(t.term_id, t.alias_id) for t in terms] == [(entry.id, None), (entry.id, entry.aliases[0].id)]
+    assert linked.render(glossary) == "Hi Iroha and Mai-chan!"
+
+
+def test_link_content_respects_word_boundaries_and_case() -> None:
+    glossary = Glossary(entries=[OrganizationEntry(name="America")])
+    content = Content(nodes=[TextNode(text="an American in america visits America.")])
+    linked = link_content(content, glossary)
+    terms = [n for n in linked.nodes if isinstance(n, TermNode)]
+    assert len(terms) == 1
+    assert linked.render(glossary) == "an American in america visits America."
+
+
+def test_link_content_skips_lowercase_and_ambiguous_forms() -> None:
+    glossary = Glossary(entries=[OtherEntry(name="teacher"), PersonEntry(name="Mai"), PersonEntry(name="Mai")])
+    content = Content(nodes=[TextNode(text="the teacher told Mai a secret")])
+    linked = link_content(content, glossary)
+    assert not any(isinstance(n, TermNode) for n in linked.nodes)
+
+
+def test_link_content_prefers_longest_form() -> None:
+    glossary = Glossary(entries=[OrganizationEntry(name="Super Chat"), OtherEntry(name="Chat")])
+    sc, chat = glossary.entries
+    content = Content(nodes=[TextNode(text="a Super Chat and a Chat")])
+    linked = link_content(content, glossary)
+    terms = [n for n in linked.nodes if isinstance(n, TermNode)]
+    assert [t.term_id for t in terms] == [sc.id, chat.id]
+
+
+def test_link_content_is_idempotent_and_keeps_existing_terms() -> None:
+    glossary = Glossary(entries=[PersonEntry(name="Iroha")])
+    content = Content(nodes=[TextNode(text="Iroha met Iroha")])
+    once = link_content(content, glossary)
+    twice = link_content(once, glossary)
+    assert once.to_dict() == twice.to_dict()
+    assert sum(isinstance(n, TermNode) for n in twice.nodes) == 2
+
+
+def test_relink_backfills_all_chapters() -> None:
+    wn = WebNovel("src", "")
+    person = PersonEntry(name="Iroha")
+    wn.glossary.add(person)
+    wn.chapters.append(
+        Chapter(original_title="o", original_content="c", title="C1", content=Content(nodes=[TextNode(text="Hi Iroha")]))
+    )
+    changed = wn.relink()
+    assert changed == 1
+    assert any(isinstance(n, TermNode) and n.term_id == person.id for n in wn.chapters[0].content.nodes)
+    assert wn.relink() == 0
 
 
 def test_apply_glossary_delete() -> None:

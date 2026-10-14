@@ -102,8 +102,6 @@ class GlossaryUpdate:
     pronouns: str = ""
     medium: str = ""
     specified_type: str = ""
-    # Which content fields the model actually sent (set by from_dict). None means "all fields are
-    # present", so a directly-constructed update behaves like a full entry.
     _provided: frozenset[str] | None = field(default=None, init=False, repr=False, compare=False)
 
     def provides(self, field_name: str) -> bool:
