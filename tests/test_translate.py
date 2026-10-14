@@ -394,6 +394,52 @@ def test_full_schema_is_sent_to_the_model() -> None:
     )
 
 
+def test_title_only_edit_preserves_content() -> None:
+    wn = WebNovel("src", "")
+    wn.chapters.append(
+        Chapter(original_title="o", original_content="c", title="Old", content=Content(nodes=[TextNode(text="body stays")]))
+    )
+    cid = wn.chapters[0].id
+    edit = TranslationResponse(chapters=[ChapterTranslation(title="New Title", target_id=cid)])  # no content sent
+    wn.provider = FakeProvider(_dump(edit))
+    wn.request_change("change only the title")
+    assert wn.chapters[0].title == "New Title"
+    assert wn.chapters[0].render(wn.glossary) == "body stays"  # body preserved
+
+
+def test_provided_empty_content_is_rejected() -> None:
+    wn = WebNovel("src", "")
+    wn.chapters.append(
+        Chapter(original_title="o", original_content="c", title="Old", content=Content(nodes=[TextNode(text="body")]))
+    )
+    cid = wn.chapters[0].id
+    reply = TranslationResponse(
+        chapters=[ChapterTranslation(title="New", target_id=cid, content=Content(nodes=[TextNode(text="")]))]
+    )
+    provider = FakeProvider(_dump(reply))
+    wn.provider = provider
+    with pytest.raises(TranslationError, match="response schema invalid"):
+        wn.request_change("retitle")
+    assert any("content is empty" in m.content for m in provider.last_messages)
+    assert wn.chapters[0].render(wn.glossary) == "body"  # untouched on rejection
+
+
+def test_new_chapter_without_content_is_rejected() -> None:
+    reply = TranslationResponse(chapters=[ChapterTranslation(title="Brand New")])  # add with no content
+    provider = FakeProvider(_dump(reply))
+    wn = WebNovel("src", "", provider=provider)
+    with pytest.raises(TranslationError, match="response schema invalid"):
+        wn.request_change("add a chapter")
+    assert any("new chapter has no content" in m.content for m in provider.last_messages)
+
+
+def test_empty_draft_is_rejected() -> None:
+    provider = FakeProvider([_analysis(), _draft(text="")])
+    wn = WebNovel("src", "", provider=provider)
+    with pytest.raises(TranslationError, match="response schema invalid"):
+        wn.translate_new_chapter("t", "c")
+
+
 def test_review_and_linking_embed_the_chapter() -> None:
     cleanup = ChapterCleanup(title="Ch1", content=Content(nodes=[TextNode(text="cleaned text")]))
     provider = FakeProvider([_analysis(), _draft(text="draft text"), json.dumps(cleanup.to_dict()), _draft()])

@@ -110,6 +110,9 @@ def test_generate_prompt_varies() -> None:
     assert "generic" in analysis
     assert "Notes are always provided" in generate_prompt(TranslationSettings(context_type=ContextType.NONE))
     assert "Notes are always provided" in generate_prompt(TranslationSettings())
+    # a request only edits; the model must not reply/answer the user in content
+    assert "reply to, answer, or acknowledge the user" in generate_prompt(TranslationSettings())
+    assert "A request only EDITS the project" in generate_prompt(TranslationSettings())
 
 
 def test_ids_generated_and_unique() -> None:

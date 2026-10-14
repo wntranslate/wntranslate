@@ -184,25 +184,28 @@ class ChapterTranslation:
 
     The source title and text are not part of the model's output; they are supplied by
     the caller of translate_new_chapter, or kept from the existing chapter on a revision.
+    content, kind, and summary are optional: when editing an existing chapter (target_id set),
+    an omitted field (None) means "leave it unchanged", so a title can change without resending
+    the body. A newly added chapter must include content.
 
     Args:
         title: Translated title.
-        content: Translated content nodes.
-        kind: Kind of unit.
-        summary: Optional short summary of the chapter.
+        content: Translated content nodes, or None to keep the existing chapter's content.
+        kind: Kind of unit, or None to keep the existing chapter's kind.
+        summary: Short summary, or None to keep the existing chapter's summary.
         target_id: Existing chapter id to replace, or None to append.
         position: Index to place the chapter at, or None to keep or append.
     """
 
     title: str = ""
-    content: Content = field(default_factory=Content)
-    kind: ChapterKind = ChapterKind.CHAPTER
+    content: Content | None = None
+    kind: ChapterKind | None = None
     summary: str | None = None
     target_id: str | None = None
     position: int | None = None
 
     def to_chapter(self, original_title: str = "", original_content: str = "") -> Chapter:
-        """Build a chapter from this payload and the given source title and text.
+        """Build a new chapter from this payload and the given source title and text.
 
         Args:
             original_title: Source-language title to store on the chapter.
@@ -215,25 +218,25 @@ class ChapterTranslation:
             original_title=original_title,
             original_content=original_content,
             title=self.title,
-            content=self.content,
-            kind=self.kind,
+            content=self.content if self.content is not None else Content(),
+            kind=self.kind if self.kind is not None else ChapterKind.CHAPTER,
             summary=self.summary,
         )
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize to a plain dict.
+        """Serialize to a plain dict, omitting fields left unset for an edit.
 
         Returns:
             A JSON-compatible representation.
         """
-        return {
-            "title": self.title,
-            "content": self.content.to_dict(),
-            "kind": self.kind.value,
-            "summary": self.summary,
-            "target_id": self.target_id,
-            "position": self.position,
-        }
+        data: dict[str, Any] = {"title": self.title, "target_id": self.target_id, "position": self.position}
+        if self.content is not None:
+            data["content"] = self.content.to_dict()
+        if self.kind is not None:
+            data["kind"] = self.kind.value
+        if self.summary is not None:
+            data["summary"] = self.summary
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ChapterTranslation:
@@ -245,10 +248,12 @@ class ChapterTranslation:
         Returns:
             The reconstructed payload.
         """
+        content = data.get("content")
+        kind = data.get("kind")
         return cls(
             title=data.get("title", ""),
-            content=Content.from_dict(data.get("content", {})),
-            kind=ChapterKind(data.get("kind", ChapterKind.CHAPTER.value)),
+            content=Content.from_dict(content) if content is not None else None,
+            kind=ChapterKind(kind) if kind is not None else None,
             summary=data.get("summary"),
             target_id=data.get("target_id"),
             position=data.get("position"),
@@ -679,10 +684,9 @@ def response_schema(settings: TranslationSettings) -> dict[str, Any]:
         "target_id": {"type": ["string", "null"]},
         "position": {"type": ["integer", "null"]},
     }
-    chapter_required = ["title", "content"]
+    chapter_required = ["title"]  # content/kind/summary are optional: an edit may omit them to keep the current values
     if settings.generate_chapter_summaries:
         chapter_properties["summary"] = {"type": "string"}
-        chapter_required.append("summary")
 
     return {
         "type": "object",

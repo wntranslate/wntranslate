@@ -9,7 +9,7 @@ import jsonschema
 
 from ._version import __version__
 from .chapter import Chapter
-from .content import Content, TermNode
+from .content import Content, TermNode, TextNode
 from .context import Context
 from .enums import ContextType, GlossaryOp, RequestKind
 from .glossary import Glossary
@@ -51,6 +51,13 @@ _MAX_CONTINUATION_ROUNDS = 100
 _OVERVIEW_CHAPTERS = 10
 
 _T = TypeVar("_T")
+
+
+def _content_is_empty(content: Content) -> bool:
+    """Whether a chapter's content renders to nothing (no prose text and no linked name)."""
+    return not any(
+        (isinstance(node, TextNode) and node.text.strip()) or isinstance(node, TermNode) for node in content.nodes
+    )
 
 
 def _cap_runs(text: str, limit: int) -> str:
@@ -520,6 +527,7 @@ class _BaseWebNovel:
 
     def _validate_result(self, result: object) -> None:
         """Validate a parsed result's term refs and policy, raising _Retryable so _ask can retry."""
+        self._check_content_nonempty(result)
         self._check_term_refs(result)
         if isinstance(result, ChapterAnalysis):
             self._check_glossary_policy(result.glossary_updates)
@@ -531,6 +539,40 @@ class _BaseWebNovel:
         elif isinstance(result, TranslationResponse):
             self._check_policy(result)
 
+    def _result_contents(self, result: object) -> list[Content]:
+        """The chapter contents a result carries (skipping edits that omit content)."""
+        if isinstance(result, ChapterDraft | ChapterCleanup):
+            return [result.content]
+        if isinstance(result, TranslationResponse):
+            return [payload.content for payload in result.chapters if payload.content is not None]
+        return []
+
+    def _check_content_nonempty(self, result: object) -> None:
+        """Require real content where it must exist, so a translation can never be blanked.
+
+        A translation pass (draft/cleanup) must carry the full chapter. In a request, content that
+        is PROVIDED but empty is always rejected; an edit of an existing chapter may OMIT content
+        (None) to keep the current body, but a newly added chapter must include content.
+
+        Raises:
+            _SchemaError: When a pass has empty content, a chapter sends empty (not omitted)
+                content, or a new chapter omits content.
+        """
+        if isinstance(result, ChapterDraft | ChapterCleanup):
+            if _content_is_empty(result.content):
+                raise _SchemaError("the chapter content is empty; return the full translated content, every paragraph")
+        elif isinstance(result, TranslationResponse):
+            existing = {chapter.id for chapter in self.chapters}
+            for payload in result.chapters:
+                if payload.content is not None and _content_is_empty(payload.content):
+                    raise _SchemaError(
+                        "a chapter's content is empty; to keep the existing body omit content entirely, otherwise "
+                        "send the full translated content — never send empty content"
+                    )
+                is_edit = payload.target_id is not None and payload.target_id in existing
+                if not is_edit and payload.content is None:
+                    raise _SchemaError("a new chapter has no content; a new chapter must include its full translated content")
+
     def _check_term_refs(self, result: object) -> None:
         """Validate that every content term node points at a real entry and one of its own aliases.
 
@@ -538,12 +580,7 @@ class _BaseWebNovel:
             _SchemaError: When a term_id is not a glossary entry, or an alias_id does not belong
                 to that entry — so the caller can ask the model to correct it.
         """
-        contents: list[Content] = []
-        if isinstance(result, ChapterDraft | ChapterCleanup):
-            contents.append(result.content)
-        elif isinstance(result, TranslationResponse):
-            contents.extend(payload.content for payload in result.chapters)
-        for content in contents:
+        for content in self._result_contents(result):
             for node in content.nodes:
                 if not isinstance(node, TermNode):
                     continue
@@ -612,10 +649,14 @@ class _BaseWebNovel:
             else:
                 self.chapters.insert(payload.position, chapter)
             return
-        existing.title = payload.title
-        existing.content = payload.content
-        existing.kind = payload.kind
-        existing.summary = payload.summary
+        if payload.title:
+            existing.title = payload.title
+        if payload.content is not None and not _content_is_empty(payload.content):
+            existing.content = payload.content
+        if payload.kind is not None:
+            existing.kind = payload.kind
+        if payload.summary is not None:
+            existing.summary = payload.summary
         if payload.position is not None:
             self.chapters.remove(existing)
             self.chapters.insert(payload.position, existing)
