@@ -126,7 +126,11 @@ def _glossary_rules(settings: TranslationSettings) -> str:
             "only proper names and catchphrases belong."
         )
     if settings.allow_glossary_edit:
-        rules.append("Edit an entry by its id to fix or complete a field (a blank name, wrong type, pronouns, an alias).")
+        rules.append(
+            "Edit an entry by its id, sending ONLY the fields you are changing — every field you omit keeps its "
+            "current value, so revising a definition or adding an alias must NOT resend or blank the name. Use it to "
+            "fix or complete a field (a blank name, wrong type, pronouns, a new alias)."
+        )
     if settings.allow_glossary_delete:
         rules.append("Delete an entry by its id only once it is obsolete and no chapter still uses it.")
     if settings.allow_glossary_add or settings.allow_glossary_edit:

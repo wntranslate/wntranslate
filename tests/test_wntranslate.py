@@ -37,7 +37,7 @@ from wntranslate import (
     request_schema,
     response_schema,
 )
-from wntranslate.webnovel import _flatten
+from wntranslate.webnovel import TranslationError, _flatten
 
 
 def test_version() -> None:
@@ -352,6 +352,51 @@ def test_apply_glossary_edit_preserves_ids() -> None:
     assert edited.name == "Linne"
     assert edited.aliases[0].id == person.aliases[0].id
     assert edited.aliases[0].translation == "Lin-"
+
+
+def test_apply_glossary_edit_partial_keeps_omitted_fields() -> None:
+    # Regression: an edit that sends only a changed field (the model's natural behavior) must not
+    # wipe the name/original_name/pronouns it omitted. Parsed via from_dict to exercise the real path.
+    wn = WebNovel("src", "")
+    person = PersonEntry(
+        name="Mai",
+        original_name="マイ",
+        definition="old",
+        aliases=[Alias(original="マイちゃん", translation="Mai-chan")],
+        pronouns="she/her",
+    )
+    wn.glossary.add(person)
+    response = TranslationResponse.from_dict(
+        {
+            "chapters": [],
+            "glossary_updates": [
+                {
+                    "op": "edit",
+                    "target_id": person.id,
+                    "definition": "updated",
+                    "aliases": [{"original": "マイちゃん", "translation": "Mai-chan"}],
+                }
+            ],
+            "context": None,
+        }
+    )
+    wn.apply_response(response)
+    edited = wn.glossary.get(person.id)
+    assert isinstance(edited, PersonEntry)
+    assert edited.name == "Mai"
+    assert edited.original_name == "マイ"
+    assert edited.pronouns == "she/her"
+    assert edited.definition == "updated"
+    assert edited.aliases[0].id == person.aliases[0].id
+
+
+def test_glossary_edit_blanking_name_rejected() -> None:
+    wn = WebNovel("src", "")
+    person = PersonEntry(name="Mai")
+    wn.glossary.add(person)
+    update = GlossaryUpdate.from_dict({"op": "edit", "target_id": person.id, "name": ""})
+    with pytest.raises(TranslationError, match="blank the name"):
+        wn._check_glossary_policy([update])
 
 
 def test_apply_glossary_delete() -> None:

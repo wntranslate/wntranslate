@@ -70,6 +70,11 @@ class AliasSuggestion:
         return cls(original=data["original"], translation=data.get("translation", ""), context=data.get("context"))
 
 
+_MERGE_FIELDS = frozenset(
+    {"name", "original_name", "type", "definition", "aliases", "pronouns", "medium", "specified_type"}
+)
+
+
 @dataclass
 class GlossaryUpdate:
     """A glossary change proposed by the model: add, edit, or delete.
@@ -97,6 +102,41 @@ class GlossaryUpdate:
     pronouns: str = ""
     medium: str = ""
     specified_type: str = ""
+    # Which content fields the model actually sent (set by from_dict). None means "all fields are
+    # present", so a directly-constructed update behaves like a full entry.
+    _provided: frozenset[str] | None = field(default=None, init=False, repr=False, compare=False)
+
+    def provides(self, field_name: str) -> bool:
+        """Whether an edit should apply this field, i.e. the model sent it (or it wasn't tracked)."""
+        return self._provided is None or field_name in self._provided
+
+    def merged_entry(self, existing: GlossaryEntry) -> GlossaryEntry:
+        """Build the entry an edit should produce, keeping fields the update did not provide.
+
+        A glossary edit is a partial update: the model sends only the fields it wants to change.
+        Fields it omits are taken from the existing entry, so editing (say) a definition can never
+        wipe the name. Alias ids are re-matched by Glossary.replace.
+
+        Args:
+            existing: The entry being edited.
+
+        Returns:
+            The merged entry to store in place of the existing one.
+        """
+        kept_aliases = [AliasSuggestion(a.original, a.translation, a.context) for a in existing.aliases]
+        merged = GlossaryUpdate(
+            op=GlossaryOp.EDIT,
+            target_id=self.target_id,
+            name=self.name if self.provides("name") else existing.name,
+            original_name=self.original_name if self.provides("original_name") else existing.original_name,
+            type=self.type if self.provides("type") else existing.type,
+            definition=self.definition if self.provides("definition") else existing.definition,
+            aliases=self.aliases if self.provides("aliases") else kept_aliases,
+            pronouns=self.pronouns if self.provides("pronouns") else getattr(existing, "pronouns", ""),
+            medium=self.medium if self.provides("medium") else getattr(existing, "medium", ""),
+            specified_type=self.specified_type if self.provides("specified_type") else getattr(existing, "specified_type", ""),
+        )
+        return merged.to_entry()
 
     def to_entry(self) -> GlossaryEntry:
         """Build a new glossary entry of the matching subclass.
@@ -164,7 +204,7 @@ class GlossaryUpdate:
         Returns:
             The reconstructed update.
         """
-        return cls(
+        update = cls(
             op=GlossaryOp(data.get("op", GlossaryOp.NEW.value)),
             target_id=data.get("target_id"),
             name=data.get("name", ""),
@@ -176,6 +216,8 @@ class GlossaryUpdate:
             medium=data.get("medium", ""),
             specified_type=data.get("specified_type", ""),
         )
+        update._provided = frozenset(key for key in _MERGE_FIELDS if key in data)
+        return update
 
 
 @dataclass

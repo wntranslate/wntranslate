@@ -519,6 +519,11 @@ class _BaseWebNovel:
                 raise _Retryable(f"glossary {action} not allowed")
             if counts[op] > limit:
                 raise _Retryable(f"exceeds glossary {action} limit: {limit}")
+        for update in updates:
+            if update.op is GlossaryOp.NEW and not update.name.strip():
+                raise _Retryable("a new glossary entry needs a non-blank name")
+            if update.op is GlossaryOp.EDIT and update.provides("name") and not update.name.strip():
+                raise _Retryable("a glossary edit must not blank the name; omit name to keep the current one")
         self._check_glossary_references(updates)
 
     def _check_reorder(self, position: int | None) -> None:
@@ -617,7 +622,7 @@ class _BaseWebNovel:
             entry = self.glossary.get(update.target_id)
             if update.op is GlossaryOp.DELETE and update.target_id in term_ids:
                 raise _Retryable(f"cannot delete glossary entry in use by a chapter: {update.target_id}")
-            if update.op is GlossaryOp.EDIT and entry is not None:
+            if update.op is GlossaryOp.EDIT and entry is not None and update.provides("aliases"):
                 kept = {suggestion.original for suggestion in update.aliases}
                 if any(alias.id in alias_ids and alias.original not in kept for alias in entry.aliases):
                     raise _Retryable(f"cannot drop glossary alias in use by a chapter: {update.target_id}")
@@ -635,8 +640,14 @@ class _BaseWebNovel:
             if update.target_id is not None:
                 self.glossary.remove(update.target_id)
         elif update.op is GlossaryOp.EDIT:
-            if update.target_id is not None:
-                self.glossary.replace(update.target_id, update.to_entry())
+            if update.target_id is None:
+                return
+            existing = self.glossary.get(update.target_id)
+            if existing is not None:
+                # An edit is a partial update: merge the sent fields onto the existing entry so an
+                # edit that omits name/original_name (e.g. just revising the definition) can never
+                # blank them. Replacing wholesale with to_entry would wipe every omitted field.
+                self.glossary.replace(update.target_id, update.merged_entry(existing))
         else:
             self.glossary.add(update.to_entry())
 
