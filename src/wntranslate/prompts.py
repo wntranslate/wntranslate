@@ -60,7 +60,8 @@ _GLOSSARY_EXPLANATION = (
     "The glossary keeps a name's rendering consistent across chapters: reference a name by its entry id (no alias id) "
     "and a variant by its alias id, never by text (ids resolve on export). The system assigns ids — never invent or "
     "reuse one. Entry fields: name (target-language rendering, required, never blank); original_name (exact source "
-    "form, required, never blank); type (person/item/organization/creative_work/other); definition (short); pronouns "
+    "form, required, never blank); type (person/item/organization/creative_work/other); definition (a few words "
+    "identifying who or what it is — not a description, backstory, or full sentence); pronouns "
     "(for a person, when the text shows them); medium (for a creative_work); specified_type (for other). aliases are "
     "ALTERNATE forms of the same name only (nicknames, honorifics like Name-chan/-san/-sama, cut-off forms, alternate "
     "readings), each with original (source form), translation (output form), and optional context. Put the base name "
@@ -69,10 +70,11 @@ _GLOSSARY_EXPLANATION = (
 
 _GLOSSARY_TYPES = (
     "Set each entry's type correctly; never default to 'other'. A named character or being is person (fill pronouns "
-    "when the text shows them). A place, world, group, company, team, or faction is organization. A named object, "
-    "tool, weapon, food, skill, or technique is item. A referenced book, manga, anime, game, song, or film is "
-    "creative_work. Use 'other' only when none fit, with a short specified_type; a recurring coined phrase or "
-    "catchphrase is a valid 'other'."
+    "when the text shows them). A place, world, group, company, team, or faction is organization. A specifically "
+    "named, one-of-a-kind object or artifact (one with its own proper name) is item — a generic item, skill, or "
+    "technique is NOT a glossary entry. A referenced book, manga, anime, game, song, or film is creative_work. Use "
+    "'other' only when none fit, with a short specified_type; a recurring coined phrase or catchphrase is a valid "
+    "'other'."
 )
 
 _NOTES_RULE = (
@@ -120,12 +122,15 @@ def _glossary_rules(settings: TranslationSettings) -> str:
     rules = []
     if settings.allow_glossary_add:
         rules.append(
-            "The glossary holds names (proper nouns) and recurring fixed expressions that must read the same every "
-            "time: characters, places, organizations, named items or skills, recurring work titles, and "
-            "catchphrases or coined terms. Add an entry the first time one appears, filling name, original_name, "
-            "type, definition, pronouns (for a person), and any alias forms seen so far. Add an alias to the existing "
-            "entry when a known name or phrase appears in a new form. Do NOT add ordinary, generic, or one-off words, "
-            "verbs, concepts, or descriptions."
+            "The glossary holds ONLY proper NAMES that must read the same every time (specific characters, places, "
+            "organizations, and titles of works) and recurring CATCHPHRASES or coined signature expressions. First "
+            "check the glossary already provided: if it already has the name (or a variant), reuse that entry — never "
+            "add a duplicate entry or alias for something already covered. Otherwise add an entry the first time a "
+            "qualifying name or catchphrase appears, filling name, original_name, type, a short definition, pronouns "
+            "(for a person), and any alias forms seen so far; add an alias to the existing entry when a known name "
+            "appears in a new form. Do NOT add generic, common, or one-off names ('the man', 'the guild', 'the "
+            "potion'), ordinary words, verbs, concepts, descriptions, or generic items, skills, or techniques — only "
+            "proper names and catchphrases belong in the glossary."
         )
     if settings.allow_glossary_edit:
         rules.append("Edit an entry by its id to fix or complete any field (a blank name, wrong type, pronouns, an alias).")
@@ -280,8 +285,14 @@ def generate_analysis_prompt(settings: TranslationSettings) -> str:
     sections = [
         "Pass 1 of 4 — analysis only; do NOT translate the chapter in this pass.",
         _glossary_rules(settings),
-        _NOTES_RULE,
     ]
+    if settings.allow_glossary_add:
+        sections.append(
+            "Be conservative with the glossary: add ONLY genuine proper names and catchphrases, never a generic name, "
+            "and never an entry that already exists in the provided glossary — scan it first and reuse the match "
+            "instead of creating a duplicate."
+        )
+    sections.append(_NOTES_RULE)
     summary = _summary_rule(settings)
     if summary is not None:
         sections.append(summary)

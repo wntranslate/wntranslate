@@ -27,6 +27,7 @@ from wntranslate import (
     TranslationResponse,
     TranslationSettings,
     WebNovel,
+    generate_analysis_prompt,
     generate_linking_prompt,
     generate_prompt,
     generate_translation_prompt,
@@ -102,6 +103,11 @@ def test_generate_prompt_varies() -> None:
     summary_prompt = generate_prompt(TranslationSettings(context_type=ContextType.ROLLING_SUMMARY))
     assert "cumulative digest of the entire story" in summary_prompt
     assert "BUILD ON IT" in summary_prompt
+    assert "not a description, backstory, or full sentence" in generate_prompt(TranslationSettings())
+    analysis = generate_analysis_prompt(TranslationSettings())
+    assert "proper names and catchphrases" in analysis
+    assert "duplicate" in analysis
+    assert "generic" in analysis
     assert "Notes are always provided" in generate_prompt(TranslationSettings(context_type=ContextType.NONE))
     assert "Notes are always provided" in generate_prompt(TranslationSettings())
 

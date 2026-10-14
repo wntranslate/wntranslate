@@ -103,6 +103,19 @@ def load_chapter(path: Path) -> tuple[str, str]:
     return title.strip(), content.strip()
 
 
+def _retranslate_form(index: int) -> str:
+    return f'<form method="post" action="/chapter/{index}/retranslate" class="retranslate"><button>Retranslate</button></form>'
+
+
+def _synopsis_html(synopsis: str) -> str:
+    """Render a plain-text synopsis as paragraphs with hard line breaks, escaped."""
+    paragraphs = []
+    for part in synopsis.split("\n\n"):
+        if part.strip():
+            paragraphs.append("<p>" + "<br>".join(escape(line) for line in part.split("\n")) + "</p>")
+    return "".join(paragraphs)
+
+
 def _nav(index: int, total: int) -> str:
     prev = f'<a href="/chapter/{index - 1}">&larr; Prev</a>' if index > 0 else '<span class="disabled">&larr; Prev</span>'
     nxt = (
@@ -131,7 +144,7 @@ _TOC_SCRIPT = r"""
 window.applyUpdate = function (d) {
   var t = document.getElementById('book-title'); if (t) { t.textContent = d.title; }
   var syn = document.getElementById('synopsis');
-  if (syn) { syn.innerHTML = (d.synopsis || '').split('\n\n').filter(function (p) { return p.trim(); }).map(function (p) { return '<p>' + esc(p) + '</p>'; }).join(''); }
+  if (syn) { syn.innerHTML = (d.synopsis || '').split('\n\n').filter(function (p) { return p.trim(); }).map(function (p) { return '<p>' + p.split('\n').map(esc).join('<br>') + '</p>'; }).join(''); }
   var ol = document.getElementById('toc');
   if (ol) { ol.innerHTML = d.chapters.map(function (c) { return '<li><a href="/chapter/' + c.index + '">' + esc(c.title) + '</a> <span class="badge">' + esc(c.badge) + '</span></li>'; }).join(''); }
   var rs = document.getElementById('request-status'); if (rs) { rs.textContent = d.request; }
@@ -510,10 +523,9 @@ class Translator:
             )
         heading = escape(self.project.title or self.project.original_title)
         synopsis = self.project.synopsis or self.project.original_synopsis or ""
-        paragraphs = "".join(f"<p>{escape(part)}</p>" for part in synopsis.split("\n\n") if part.strip())
         body = (
             f'<main class="wrap"><h1 id="book-title">{heading}</h1>'
-            f'<div id="synopsis" class="synopsis">{paragraphs}</div>'
+            f'<div id="synopsis" class="synopsis">{_synopsis_html(synopsis)}</div>'
             f'<ol id="toc" class="toc-list">{"".join(items)}</ol>{self._render_request_box()}</main>'
         )
         return _page("Contents", body, script=_TOC_SCRIPT)
@@ -539,16 +551,13 @@ class Translator:
         if state == "done" and chapter is not None:
             body = render_content_html(chapter.content, self.project.glossary)
             heading = escape(chapter.title or f"Chapter {index + 1}")
-            retranslate = (
-                f'<form method="post" action="/chapter/{index}/retranslate" class="retranslate">'
-                f"<button>Retranslate</button></form>"
-            )
-            inner = f'{_nav(index, total)}<main class="wrap"><h1>{heading}</h1>{body}{retranslate}</main>'
+            inner = f'{_nav(index, total)}<main class="wrap"><h1>{heading}</h1>{body}{_retranslate_form(index)}</main>'
             return _page(heading, inner, script=script)
         stream = f'<pre id="stream" class="stream">{escape(self.stream_text.get(index, ""))}</pre>'
         if state == "error":
             message = f'<p class="status error">{escape(error or "error")}</p>'
-            return _page(f"Chapter {index + 1}", f'{_nav(index, total)}<main class="wrap">{message}{stream}</main>', script=script)
+            inner = f'{_nav(index, total)}<main class="wrap">{message}{stream}{_retranslate_form(index)}</main>'
+            return _page(f"Chapter {index + 1}", inner, script=script)
         message = f'<p class="status">Translating chapter {index + 1}…</p>'
         return _page(f"Chapter {index + 1}", f'{_nav(index, total)}<main class="wrap">{message}{stream}</main>', script=script)
 
